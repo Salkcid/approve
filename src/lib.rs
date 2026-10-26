@@ -173,7 +173,7 @@ pub fn render_prompt(request: &Request, facts: &Facts) -> Result<String, String>
             origin.push_str("Additional origin details omitted to fit the dialog.");
         }
         let prompt = format!(
-            "Reason supplied by caller:\n  {}\n\nObserved execution facts:\n\nRequested command (quoted arguments):\n  {}\n\nWorking directory:\n  {}\n\nCalling user: {} (UID {})\nRun as: root\n\nOrigin (process snapshot):\n  {}\n\nDisplay lines wrap. Quoted values use backslash escapes; no shell expansion.\n\nPassword: ",
+            "Reason supplied by caller:\n  {}\n\nRequested command (quoted arguments):\n  {}\n\nWorking directory:\n  {}\n\nCalling user: {} (UID {})\nRun as: root\n\nOrigin (process snapshot):\n  {}\n\nDisplay lines wrap. Quoted values use backslash escapes; no shell expansion.\n\nPassword: ",
             quote(&request.description),
             command,
             quote(facts.cwd.as_os_str()),

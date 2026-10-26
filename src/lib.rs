@@ -4,7 +4,7 @@ use std::fmt::Write;
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub const USAGE: &str = "Usage: approve -d <description> -- <command> [arguments...]";
@@ -95,10 +95,16 @@ impl Facts {
     pub fn collect() -> Result<Self, String> {
         let cwd =
             std::env::current_dir().map_err(|e| format!("cannot read working directory: {e}"))?;
-        let status = fs::read_to_string("/proc/self/status")
+        Self::collect_from(cwd, Path::new("/proc"), Path::new("/etc/passwd"))
+    }
+
+    // Keep filesystem inputs explicit so snapshots can be tested without changing
+    // process-wide environment or relying on the host's ancestry and accounts.
+    fn collect_from(cwd: PathBuf, proc: &Path, passwd: &Path) -> Result<Self, String> {
+        let status = fs::read_to_string(proc.join("self/status"))
             .map_err(|e| format!("cannot read process identity: {e}"))?;
         let uid = status_number(&status, "Uid:").ok_or("calling UID unavailable")?;
-        let username = passwd_name(uid);
+        let username = passwd_name(uid, passwd);
         let mut origin = Vec::new();
         let mut parent = status_number(&status, "PPid:");
         let mut seen = HashSet::new();
@@ -111,11 +117,11 @@ impl Facts {
             if !seen.insert(pid) {
                 break;
             }
-            let executable = fs::read_link(format!("/proc/{pid}/exe"))
+            let executable = fs::read_link(proc.join(format!("{pid}/exe")))
                 .map(|p| p.into_os_string())
                 .unwrap_or_else(|_| "executable unavailable".into());
             origin.push(Origin { pid, executable });
-            parent = fs::read_to_string(format!("/proc/{pid}/status"))
+            parent = fs::read_to_string(proc.join(format!("{pid}/status")))
                 .ok()
                 .and_then(|s| status_number(&s, "PPid:"));
         }
@@ -129,8 +135,8 @@ impl Facts {
 }
 
 // v1 reads local accounts. Never use USER/LOGNAME as evidence.
-fn passwd_name(uid: u32) -> Option<OsString> {
-    let passwd = fs::read("/etc/passwd").ok()?;
+fn passwd_name(uid: u32, path: &Path) -> Option<OsString> {
+    let passwd = fs::read(path).ok()?;
     passwd.split(|&b| b == b'\n').find_map(|line| {
         let mut fields = line.split(|&b| b == b':');
         let name = fields.next()?;
@@ -298,4 +304,121 @@ pub fn sudo_command(request: &Request) -> Command {
         .args(["-k", "-A", "-p", "Password: ", "--"])
         .args(&request.command);
     command
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Snapshot(PathBuf);
+
+    impl Snapshot {
+        fn new() -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "approve-snapshot-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(path.join("self")).unwrap();
+            fs::write(path.join("self/status"), "Uid:\t1000\t0\t0\t0\nPPid:\t10\n").unwrap();
+            fs::write(
+                path.join("passwd"),
+                b"malformed\nwrong:x:nope:\nother:x:2000:\nalice:x:1000:1000::/:/bin/sh\n",
+            )
+            .unwrap();
+            Self(path)
+        }
+
+        fn process(&self, pid: u32, parent: &str, executable: Option<&str>) {
+            let dir = self.0.join(pid.to_string());
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("status"), format!("PPid:\t{parent}\n")).unwrap();
+            if let Some(executable) = executable {
+                symlink(executable, dir.join("exe")).unwrap();
+            }
+        }
+
+        fn collect(&self) -> Result<Facts, String> {
+            Facts::collect_from("/observed/cwd".into(), &self.0, &self.0.join("passwd"))
+        }
+    }
+
+    impl Drop for Snapshot {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    #[test]
+    fn collects_real_uid_local_name_and_three_nearest_ancestors() {
+        let snapshot = Snapshot::new();
+        for (pid, parent, exe) in [
+            (10, "20", "/caller"),
+            (20, "30", "/parent"),
+            (30, "40", "/grandparent"),
+            (40, "0", "/excluded"),
+        ] {
+            snapshot.process(pid, parent, Some(exe));
+        }
+        let facts = snapshot.collect().unwrap();
+        assert_eq!(facts.cwd, PathBuf::from("/observed/cwd"));
+        assert_eq!(facts.uid, 1000); // The first UID, not the effective UID.
+        assert_eq!(facts.username.as_deref(), Some(OsStr::new("alice")));
+        let origins: Vec<_> = facts
+            .origin
+            .iter()
+            .map(|o| (o.pid, o.executable.as_os_str()))
+            .collect();
+        assert_eq!(
+            origins,
+            vec![
+                (10, OsStr::new("/caller")),
+                (20, OsStr::new("/parent")),
+                (30, OsStr::new("/grandparent"))
+            ]
+        );
+    }
+
+    #[test]
+    fn ancestry_stops_at_namespace_boundaries_bad_parents_and_cycles() {
+        for parent in ["0", "invalid", "", "10"] {
+            let snapshot = Snapshot::new();
+            snapshot.process(10, parent, None);
+            let facts = snapshot.collect().unwrap();
+            assert_eq!(facts.origin.len(), 1, "parent {parent:?}");
+            assert_eq!(facts.origin[0].pid, 10);
+            assert_eq!(facts.origin[0].executable, "executable unavailable");
+        }
+        let snapshot = Snapshot::new();
+        // Missing parent status and exe still produce an explicit caller entry.
+        let facts = snapshot.collect().unwrap();
+        assert_eq!(facts.origin.len(), 1);
+        assert_eq!(facts.origin[0].executable, "executable unavailable");
+        fs::write(snapshot.0.join("self/status"), "Uid: 1000\nPPid: 0\n").unwrap();
+        assert!(snapshot.collect().unwrap().origin.is_empty());
+    }
+
+    #[test]
+    fn missing_accounts_and_unreadable_identity_are_handled() {
+        let snapshot = Snapshot::new();
+        fs::write(snapshot.0.join("passwd"), "other:x:2000:\n").unwrap();
+        assert!(snapshot.collect().unwrap().username.is_none());
+        fs::remove_file(snapshot.0.join("passwd")).unwrap();
+        assert!(snapshot.collect().unwrap().username.is_none());
+        for status in ["PPid: 10\n", "Uid: invalid\n", "Uid: 4294967296\n"] {
+            fs::write(snapshot.0.join("self/status"), status).unwrap();
+            assert_eq!(snapshot.collect().err().unwrap(), "calling UID unavailable");
+        }
+        fs::remove_file(snapshot.0.join("self/status")).unwrap();
+        assert!(
+            snapshot
+                .collect()
+                .err()
+                .unwrap()
+                .contains("cannot read process identity")
+        );
+    }
 }

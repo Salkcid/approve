@@ -116,6 +116,19 @@ fn preserves_execution_arguments_cwd_streams_and_status() {
     assert!(review.contains(&"root".into()));
     assert_eq!(sudo[4], "--");
     assert_eq!(sudo[5], "/bin/sh");
+    let displayed_command: Vec<_> = review[1..]
+        .chunks_exact(2)
+        .filter(|pair| pair[0] == "--command-arg")
+        .map(|pair| pair[1].clone())
+        .collect();
+    let expected_command: Vec<_> = sudo[5..]
+        .iter()
+        .map(|arg| {
+            let quoted = approve::quote(arg);
+            quoted[1..quoted.len() - 1].to_owned()
+        })
+        .collect();
+    assert_eq!(displayed_command, expected_command);
     assert_eq!(&sudo[sudo.len() - values.len()..], &values);
     let helper = fs::read_to_string(fixture.0.join("helper")).unwrap();
     assert_eq!(
@@ -148,7 +161,12 @@ fn sudo_failure_is_returned_without_running_the_target() {
 fn invalid_and_oversized_requests_never_invoke_sudo() {
     let fixture = Fixture::new();
     for args in [
+        vec![],
+        vec!["--unknown"],
+        vec!["-d"],
         vec!["-d", "", "--", "id"],
+        vec!["-d", " \t\n", "--", "id"],
+        vec!["-d", "why", "--", ""],
         vec!["-d", "why", "id"],
         vec!["-d", "why", "--"],
     ] {
@@ -387,4 +405,403 @@ fn executable_lookup_supports_path_and_rejects_invalid_override() {
         assert_eq!(output.status.code(), Some(2));
         assert!(String::from_utf8_lossy(&output.stderr).contains("APPROVE_ASKPASS"));
     }
+}
+
+// Deliberately bypass the production encoder to exercise adapter-side validation.
+fn unchecked_transport(args: &[String]) -> String {
+    args.iter()
+        .map(|value| format!("{}:{value}", value.len()))
+        .collect()
+}
+
+fn assert_adapter_rejects(fixture: &Fixture, transport: &OsStr, prompts: &[&str], message: &str) {
+    let output = fixture
+        .command(env!("CARGO_BIN_EXE_approve-askpass"))
+        .env(approve::REVIEW_ENV, transport)
+        .args(prompts)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(message),
+        "{output:?}"
+    );
+    assert!(!fixture.0.join("askpass-args").exists());
+}
+
+#[test]
+fn adapter_validates_all_required_fields_before_launching_askpass() {
+    let fixture = Fixture::new();
+    let valid = sample_review();
+    for option in [
+        "--reason",
+        "--working-directory",
+        "--requesting-user",
+        "--requesting-uid",
+        "--run-as-user",
+    ] {
+        let index = valid.iter().position(|s| s == option).unwrap();
+        let mut missing = valid.clone();
+        missing.drain(index..index + 2);
+        assert_adapter_rejects(
+            &fixture,
+            OsStr::new(&unchecked_transport(&missing)),
+            &["Password: "],
+            "incomplete review",
+        );
+        let mut duplicate = valid.clone();
+        duplicate.extend_from_slice(&valid[index..index + 2]);
+        assert_adapter_rejects(
+            &fixture,
+            OsStr::new(&unchecked_transport(&duplicate)),
+            &["Password: "],
+            "duplicate value",
+        );
+        let mut empty = valid.clone();
+        empty[index + 1].clear();
+        assert_adapter_rejects(
+            &fixture,
+            OsStr::new(&unchecked_transport(&empty)),
+            &["Password: "],
+            "missing or duplicate",
+        );
+    }
+    for (option, value, error) in [
+        ("--reason", " \t\n", "missing or duplicate"),
+        ("--command-arg", "", "empty executable"),
+        ("--requesting-uid", "-1", "invalid requesting UID"),
+        ("--requesting-uid", "+1", "invalid requesting UID"),
+        ("--requesting-uid", "4294967296", "invalid requesting UID"),
+        ("--requesting-uid", "abc", "invalid requesting UID"),
+        ("--run-as-user", "alice", "run-as user must be root"),
+        ("--origin", "12", "invalid origin"),
+        ("--origin", "0:/bin/sh", "invalid origin"),
+        ("--origin", "-1:/bin/sh", "invalid origin"),
+        ("--origin", "+1:/bin/sh", "invalid origin"),
+        ("--origin", "4294967296:/bin/sh", "invalid origin"),
+        ("--origin", "12:", "invalid origin"),
+    ] {
+        let mut args = valid.clone();
+        let index = args.iter().position(|s| s == option).unwrap();
+        args[index + 1] = value.into();
+        assert_adapter_rejects(
+            &fixture,
+            OsStr::new(&unchecked_transport(&args)),
+            &["Password: "],
+            error,
+        );
+    }
+    let mut no_command = valid.clone();
+    let mut index = 1;
+    while index < no_command.len() {
+        if no_command[index] == "--command-arg" {
+            no_command.drain(index..index + 2);
+        } else {
+            index += 2;
+        }
+    }
+    assert_adapter_rejects(
+        &fixture,
+        OsStr::new(&unchecked_transport(&no_command)),
+        &["Password: "],
+        "incomplete review",
+    );
+    let mut unknown = valid.clone();
+    unknown.extend(["--unknown".into(), "value".into()]);
+    assert_adapter_rejects(
+        &fixture,
+        OsStr::new(&unchecked_transport(&unknown)),
+        &["Password: "],
+        "unsupported review option",
+    );
+    let mut oversized = valid;
+    oversized[2] = "x".repeat(approve::MAX_REVIEW_BYTES);
+    assert_adapter_rejects(
+        &fixture,
+        OsStr::new(&unchecked_transport(&oversized)),
+        &["Password: "],
+        "refusing to truncate",
+    );
+}
+
+#[test]
+fn adapter_rejects_invalid_framing_non_utf8_and_wrong_prompt_count() {
+    let fixture = Fixture::new();
+    for encoded in [
+        "missing-colon",
+        ":x",
+        "-1:x",
+        "+1:x",
+        "x:y",
+        "999999999999999999999999999999:x",
+        "8:--review1:x",
+    ] {
+        assert_adapter_rejects(
+            &fixture,
+            OsStr::new(encoded),
+            &["Password: "],
+            "invalid review",
+        );
+    }
+    assert_adapter_rejects(
+        &fixture,
+        OsStr::from_bytes(&[0xff]),
+        &["Password: "],
+        "non-UTF-8",
+    );
+    assert_adapter_rejects(
+        &fixture,
+        OsStr::new("8:--review0:0:"),
+        &["Password: "],
+        "unsupported review option",
+    );
+    let valid = unchecked_transport(&sample_review());
+    for prompts in [vec![], vec!["one", "two"]] {
+        assert_adapter_rejects(
+            &fixture,
+            OsStr::new(&valid),
+            &prompts,
+            "expected one sudo prompt",
+        );
+    }
+}
+
+#[test]
+fn review_has_exact_ordered_fields_and_reversible_display_values() {
+    let request = approve::Request {
+        description: "reason\n\"é".into(),
+        command: vec![
+            "echo".into(),
+            "".into(),
+            "two words".into(),
+            "--help".into(),
+            "\n\r\t\"\\".into(),
+            OsString::from_vec(vec![0xff]),
+            "\\xff".into(),
+        ],
+    };
+    let facts = approve::Facts {
+        cwd: "/test\n\\é".into(),
+        uid: 1000,
+        username: Some("al\tice".into()),
+        origin: vec![
+            approve::Origin {
+                pid: 12,
+                executable: "/bin/sh:with:colons".into(),
+            },
+            approve::Origin {
+                pid: 13,
+                executable: "executable unavailable".into(),
+            },
+        ],
+    };
+    let expected: Vec<String> = [
+        "--review",
+        "--reason",
+        r#"reason\n\"\u{e9}"#,
+        "--command-arg",
+        "echo",
+        "--command-arg",
+        "",
+        "--command-arg",
+        "two words",
+        "--command-arg",
+        "--help",
+        "--command-arg",
+        r#"\n\r\t\"\\"#,
+        "--command-arg",
+        r"\xff",
+        "--command-arg",
+        r"\\xff",
+        "--working-directory",
+        r"/test\n\\\u{e9}",
+        "--requesting-user",
+        r"al\tice",
+        "--requesting-uid",
+        "1000",
+        "--run-as-user",
+        "root",
+        "--origin",
+        "12:/bin/sh:with:colons",
+        "--origin",
+        "13:executable unavailable",
+    ]
+    .map(String::from)
+    .to_vec();
+    let actual = approve::review_arguments(&request, &facts).unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(
+        approve::decode_review(&approve::encode_review(&actual).unwrap()).unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn escaping_can_exceed_budget_before_sudo_runs() {
+    let fixture = Fixture::new();
+    for (description, argument) in [
+        ("reason".to_owned(), "\n".repeat(9000)),
+        ("é".repeat(3000), "small".to_owned()),
+    ] {
+        assert!(description.len() + argument.len() < approve::MAX_REVIEW_BYTES);
+        let output = fixture
+            .command(env!("CARGO_BIN_EXE_approve"))
+            .args(["-d", &description, "--", "echo", &argument])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("refusing to truncate"));
+        assert!(!fixture.0.join("sudo-args").exists());
+    }
+}
+
+#[test]
+fn all_origins_are_preserved_and_count_toward_the_exact_budget() {
+    let mut request = approve::Request {
+        description: "reason".into(),
+        command: vec!["echo".into()],
+    };
+    let mut facts = approve::Facts {
+        cwd: "/test".into(),
+        uid: 1000,
+        username: None,
+        origin: vec![],
+    };
+    let base = approve::review_arguments(&request, &facts).unwrap();
+    request.description.push("x".repeat(
+        approve::MAX_REVIEW_BYTES
+            - base.iter().map(String::len).sum::<usize>()
+            - 3 * ("--origin".len() + "12:/bin/sh".len()),
+    ));
+    for pid in [12, 13, 14] {
+        facts.origin.push(approve::Origin {
+            pid,
+            executable: "/bin/sh".into(),
+        });
+    }
+    let args = approve::review_arguments(&request, &facts).unwrap();
+    assert_eq!(
+        args.iter().map(String::len).sum::<usize>(),
+        approve::MAX_REVIEW_BYTES
+    );
+    assert_eq!(
+        &args[args.len() - 6..],
+        [
+            "--origin",
+            "12:/bin/sh",
+            "--origin",
+            "13:/bin/sh",
+            "--origin",
+            "14:/bin/sh"
+        ]
+    );
+    assert_eq!(
+        approve::decode_review(&approve::encode_review(&args).unwrap()).unwrap(),
+        args
+    );
+    facts.origin[2].executable.push("x");
+    assert!(
+        approve::review_arguments(&request, &facts)
+            .unwrap_err()
+            .contains("refusing to truncate")
+    );
+    assert_eq!(facts.origin.len(), 3);
+}
+
+#[test]
+fn target_signal_is_preserved() {
+    use std::os::unix::process::ExitStatusExt;
+    let fixture = Fixture::new();
+    let output = fixture
+        .command(env!("CARGO_BIN_EXE_approve"))
+        .args(["-d", "signal test", "--", "/bin/sh", "-c", "kill -TERM $$"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.signal(), Some(15));
+}
+
+#[test]
+fn startup_failures_report_errors_without_running_the_target() {
+    let run = |fixture: &Fixture, binary: &str| {
+        fixture
+            .command(binary)
+            .args([
+                "-d",
+                "startup test",
+                "--",
+                "/bin/sh",
+                "-c",
+                "printf created > marker",
+            ])
+            .output()
+            .unwrap()
+    };
+    let fixture = Fixture::new();
+    let isolated = fixture.0.join("approve");
+    fs::copy(env!("CARGO_BIN_EXE_approve"), &isolated).unwrap();
+    let output = run(&fixture, isolated.to_str().unwrap());
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("approve-askpass must be installed beside approve")
+    );
+    assert!(!fixture.0.join("sudo-args").exists());
+
+    for mode in ["missing", "non-executable", "directory"] {
+        let fixture = Fixture::new();
+        fs::remove_file(fixture.0.join("askpass")).unwrap();
+        match mode {
+            "non-executable" => fs::write(fixture.0.join("askpass"), "data").unwrap(),
+            "directory" => fs::create_dir(fixture.0.join("askpass")).unwrap(),
+            _ => {}
+        }
+        for use_override in [false, true] {
+            let mut command = fixture.command(env!("CARGO_BIN_EXE_approve"));
+            if !use_override {
+                command.env_remove("APPROVE_ASKPASS");
+            }
+            let output = command
+                .args(["-d", "startup", "--", "id"])
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(2));
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains(if use_override {
+                    "APPROVE_ASKPASS must be"
+                } else {
+                    "askpass is not on PATH"
+                }),
+                "{stderr}"
+            );
+            assert!(!fixture.0.join("sudo-args").exists());
+        }
+        assert!(!fixture.0.join("marker").exists());
+    }
+    let fixture = Fixture::new();
+    fs::remove_file(fixture.0.join("sudo")).unwrap();
+    let output = run(&fixture, env!("CARGO_BIN_EXE_approve"));
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("could not execute sudo"));
+    assert!(!fixture.0.join("marker").exists());
+
+    let fixture = Fixture::new();
+    // Executable metadata passes lookup, but the interpreter cannot be executed.
+    fixture.script("askpass", "exit 0\n");
+    fs::write(
+        fixture.0.join("askpass"),
+        "#!/missing/approve-test-interpreter\n",
+    )
+    .unwrap();
+    let output = fixture
+        .command(env!("CARGO_BIN_EXE_approve-askpass"))
+        .env(approve::REVIEW_ENV, unchecked_transport(&sample_review()))
+        .arg("Password: ")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("could not execute askpass"));
+    assert!(!fixture.0.join("askpass-args").exists());
 }

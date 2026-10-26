@@ -70,11 +70,13 @@ cargo clippy --all-targets -- -D warnings
 
 Display values use reversible ASCII notation: backslashes, quotes, control
 characters, non-ASCII characters, and invalid UTF-8 bytes are escaped. Askpass
-additionally quotes command and path values, so those fields show another layer
-of backslash escaping. The original command argument bytes are passed unchanged
-to sudo. Requests exceeding askpass v0.1's 16 KiB option/value budget are rejected
-before sudo runs; no values are truncated. The scrollable dialog replaces the
-old fixed line and width limits.
+displays command arguments without outer quotes, escapes spaces as `\ ` and
+backslashes as `\\`, and displays empty arguments as `\0`. Command arguments
+therefore show another layer of backslash escaping. The working directory is
+displayed literally as supplied by approve, with no further escaping. The original
+command argument bytes are passed unchanged to sudo. Requests exceeding askpass
+v0.1's 16 KiB option/value budget are rejected before sudo runs; no values are
+truncated. The scrollable dialog replaces the old fixed line and width limits.
 
 The process snapshot includes at most the caller and two ancestors, nearest
 first. Collection stops when the parent is unavailable or outside the PID

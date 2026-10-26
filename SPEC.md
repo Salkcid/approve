@@ -72,8 +72,11 @@ Password: [                              ]
   from the dialog's environment. Never interpret data as shell code.
 - Convert display values to reversible ASCII notation without outer quotes:
   `\n`, `\r`, `\t`, `\\`, `\"`, `\u{...}` for control/non-ASCII characters,
-  and `\xNN` for invalid UTF-8 bytes. Askpass applies its own quoting to command
-  and path fields, adding a further display escaping layer.
+  and `\xNN` for invalid UTF-8 bytes. Askpass displays command arguments without
+  outer quotes, escapes spaces as `\ ` and backslashes as `\\`, and displays
+  empty arguments as `\0`, adding a further display escaping layer to commands.
+  The working directory is displayed literally as supplied by approve, with no
+  further escaping.
 - Reject requests whose option names and values exceed askpass v0.1's 16 KiB
   UTF-8 byte budget. Preserve argument boundaries, including empty arguments and
   values beginning with dashes. The dialog scrolls; no fixed line limit applies.

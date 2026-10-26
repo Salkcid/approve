@@ -141,7 +141,7 @@ fn passwd_name(uid: u32) -> Option<OsString> {
 }
 
 // Every value uses the same reversible ASCII notation, without outer quotes.
-// askpass applies its own argument quoting to command/path values afterwards.
+// askpass further escapes command arguments; it displays the cwd literally.
 fn display_value(value: &OsStr) -> String {
     let quoted = quote(value);
     quoted[1..quoted.len() - 1].to_owned()

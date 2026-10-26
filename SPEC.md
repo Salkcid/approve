@@ -34,13 +34,11 @@ and the omission notice cannot fit.
 Escape control characters and display content literally. Never silently truncate
 the command; reject requests that cannot be displayed adequately.
 
-Illustrative combined dialog (exact title, buttons, and layout may follow the
-installed askpass helper). Show the requested program separately from sudo's
-prompt transport options:
+Illustrative combined dialog body (window title: "Administrator access requested";
+exact buttons and layout may follow the installed askpass helper). Show the
+requested program separately from sudo's prompt transport options:
 
 ```text
-Administrator access requested
-
 Reason supplied by caller:
   Rebuild NixOS to reduce Waybar height
 

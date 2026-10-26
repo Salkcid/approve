@@ -6,8 +6,8 @@ collected execution facts together with password entry in a Zenity dialog.
 ## Interface
 
 ```sh
-approve -d 'Rebuild NixOS to reduce Waybar height' -- \
-  nixos-rebuild switch --flake /home/qy1n/nixos#laptop
+approve -d 'Rebuild NixOS to apply configuration changes' -- \
+  nixos-rebuild switch --flake /home/alice/nixos#desktop
 ```
 
 - Require a nonempty description and a command after `--`.
@@ -40,15 +40,15 @@ requested program separately from sudo's prompt transport options:
 
 ```text
 Reason supplied by caller:
-  Rebuild NixOS to reduce Waybar height
+  Rebuild NixOS to apply configuration changes
 
 Command:
-  nixos-rebuild switch --flake /home/qy1n/nixos#laptop
+  nixos-rebuild switch --flake /home/alice/nixos#desktop
 
 Working directory:
-  /home/qy1n/nixos
+  /home/alice/nixos
 
-Calling user: qy1n (UID 1000)
+Calling user: alice (UID 1000)
 Run as: root
 
 Origin:
@@ -87,7 +87,7 @@ Password: [                              ]
 
 ## Scope and limits
 
-- Support this laptop's normal user and password-requiring sudo configuration.
+- Support a normal local user with password-requiring sudo on Linux.
   Password-exempt rules and invocation as root are outside v1's approval guarantee:
   sudo may skip askpass in those cases.
 - Only requests made through `approve` are covered; enforcing its use is out of scope.

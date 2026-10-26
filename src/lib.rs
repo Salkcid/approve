@@ -138,7 +138,7 @@ impl Facts {
     }
 }
 
-// v1 targets this laptop's local accounts. Never use USER/LOGNAME as evidence.
+// v1 reads local accounts. Never use USER/LOGNAME as evidence.
 fn passwd_name(uid: u32) -> Option<OsString> {
     let passwd = fs::read("/etc/passwd").ok()?;
     passwd.split(|&b| b == b'\n').find_map(|line| {

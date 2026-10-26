@@ -4,11 +4,29 @@ A CLI wrapper for reviewing an agent's explanation and observed execution facts
 together with password entry in a Zenity dialog. See [SPEC.md](SPEC.md) for the
 v1 design.
 
+This is a Linux desktop tool for a local user whose sudo policy requires a
+password. It needs `sudo`, Zenity, and a graphical session. The approval dialog
+shows the submitted arguments and a snapshot of the calling process; it cannot
+verify the full behavior of a script or a mutable executable.
+
 The project-local `approve-askpass` adapter uses Zenity's hidden-entry dialog.
-The installed Zenity 4.2.2 password dialog ignores `--text`, so it cannot show
-the review details. Only the sudo child receives the adapter's `SUDO_ASKPASS`;
+Zenity 4.2.2's password dialog ignores `--text`, so it cannot show the review
+details. Only the sudo child receives the adapter's `SUDO_ASKPASS`;
 global sudo and SSH askpass settings are untouched. The adapter executes Zenity
 directly, leaving password handling to Zenity and sudo.
+
+## Install and use
+
+Install both binaries from a checkout with Rust and Cargo available:
+
+```sh
+cargo install --locked --path .
+approve -d 'Show the current user' -- id
+```
+
+The example requests sudo approval. Callers omit `sudo` and pass command
+arguments after `--`; an explicit shell is needed for shell syntax. Zenity must
+be on `PATH`, or set `APPROVE_ZENITY` to its absolute executable path.
 
 ## Development
 
@@ -38,11 +56,6 @@ cargo clippy --all-targets -- -D warnings
 ./target/debug/approve -d 'Show the current user' -- id
 ```
 
-The run example requests sudo approval. Callers omit `sudo` and pass command
-arguments after `--`; an explicit shell is needed for shell syntax. To install
-both binaries beside each other, use `cargo install --path .`. Zenity must be on
-`PATH`, or set `APPROVE_ZENITY` to its absolute executable path.
-
 Quoted display values escape control characters, non-ASCII characters, and
 invalid UTF-8 bytes. The submitted argument bytes are passed unchanged to sudo.
 Prompts wrap at 100 columns and are rejected above a conservative 4096-byte /
@@ -55,7 +68,7 @@ The automated tests use stand-ins for sudo and Zenity; they require no root
 access, GUI interaction, or passwords. They cover argument and stream
 preservation, exit status, prompt escaping, size rejection, and adapter
 cancellation. Real authentication and dialog layout require manual checks on
-the laptop, outside sandboxes that set `NoNewPrivs`.
+the intended desktop, outside sandboxes that set `NoNewPrivs`.
 
 For a harmless manual acceptance check, run from the development shell:
 
@@ -98,3 +111,7 @@ direnv reload
 Review and commit the updated `flake.lock`. To move to another stable nixpkgs
 release, change the input branch in `flake.nix`, then run the same update command.
 No NixOS rebuild is needed.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

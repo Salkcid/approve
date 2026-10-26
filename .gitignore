@@ -1,2 +1,8 @@
 .direnv/
 /target/
+.env
+.env.*
+!.env.example
+.aws/
+.codex/
+.agents/

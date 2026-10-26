@@ -8,10 +8,9 @@ use std::path::PathBuf;
 use std::process::Command;
 
 pub const USAGE: &str = "Usage: approve -d <description> -- <command> [arguments...]";
-// A conservative v1 budget, not a claim about arbitrary helpers or displays.
-pub const MAX_PROMPT_BYTES: usize = 4096;
-pub const MAX_PROMPT_LINES: usize = 40;
-pub const PROMPT_COLUMNS: usize = 100;
+// askpass v0.1 counts the UTF-8 bytes of all option names and values.
+pub const MAX_REVIEW_BYTES: usize = 16 * 1024;
+pub const REVIEW_ENV: &str = "APPROVE_REVIEW";
 
 #[derive(Debug)]
 pub struct Request {
@@ -80,11 +79,16 @@ fn status_number(status: &str, key: &str) -> Option<u32> {
     })
 }
 
+pub struct Origin {
+    pub pid: u32,
+    pub executable: OsString,
+}
+
 pub struct Facts {
     pub cwd: PathBuf,
     pub uid: u32,
     pub username: Option<OsString>,
-    pub origin: Vec<String>,
+    pub origin: Vec<Origin>,
 }
 
 impl Facts {
@@ -98,36 +102,22 @@ impl Facts {
         let mut origin = Vec::new();
         let mut parent = status_number(&status, "PPid:");
         let mut seen = HashSet::new();
-        // Bound observation work; disclose omitted ancestry, never infer identity.
-        for depth in 0..3 {
-            let Some(pid) = parent else {
-                origin.push("parent process information unavailable".into());
+        // Observe the caller and at most two ancestors. Missing executables are
+        // explicit; an unavailable parent ends this best-effort snapshot.
+        for _ in 0..3 {
+            let Some(pid) = parent.filter(|&pid| pid != 0) else {
                 break;
             };
-            if pid == 0 {
-                origin.push("parent beyond this PID namespace unavailable".into());
-                break;
-            }
             if !seen.insert(pid) {
-                origin.push("remaining ancestry unavailable (process chain changed)".into());
                 break;
             }
             let executable = fs::read_link(format!("/proc/{pid}/exe"))
-                .map(|p| quote(p.as_os_str()))
+                .map(|p| p.into_os_string())
                 .unwrap_or_else(|_| "executable unavailable".into());
-            let relation = if depth == 0 { "caller" } else { "ancestor" };
-            origin.push(format!("{relation} PID {pid}: {executable}"));
+            origin.push(Origin { pid, executable });
             parent = fs::read_to_string(format!("/proc/{pid}/status"))
                 .ok()
                 .and_then(|s| status_number(&s, "PPid:"));
-            if depth == 2 {
-                match parent {
-                    Some(0) => {}
-                    Some(_) => origin
-                        .push("Additional ancestors omitted (3-process observation limit).".into()),
-                    None => origin.push("parent process information unavailable".into()),
-                }
-            }
         }
         Ok(Self {
             cwd,
@@ -150,112 +140,162 @@ fn passwd_name(uid: u32) -> Option<OsString> {
     })
 }
 
-pub fn render_prompt(request: &Request, facts: &Facts) -> Result<String, String> {
-    let command = request
-        .command
-        .iter()
-        .map(|s| quote(s))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let username = facts
-        .username
-        .as_deref()
-        .map(quote)
-        .unwrap_or_else(|| "unavailable".into());
-    // Prefer the nearest processes, dropping whole entries rather than paths.
-    // Every candidate includes an omission notice when entries are removed.
-    for count in (0..=facts.origin.len()).rev() {
-        let mut origin = facts.origin[..count].join("\n  ");
-        if count < facts.origin.len() {
-            if !origin.is_empty() {
-                origin.push_str("\n  ");
-            }
-            origin.push_str("Additional origin details omitted to fit the dialog.");
-        }
-        let prompt = format!(
-            "Reason supplied by caller:\n  {}\n\nRequested command (quoted arguments):\n  {}\n\nWorking directory:\n  {}\n\nCalling user: {} (UID {})\nRun as: root\n\nOrigin (process snapshot):\n  {}\n\nDisplay lines wrap. Quoted values use backslash escapes; no shell expansion.\n\nPassword: ",
-            quote(&request.description),
-            command,
-            quote(facts.cwd.as_os_str()),
-            username,
-            facts.uid,
-            origin,
-        );
-        match fit_prompt(&prompt) {
-            Ok(prompt) => return Ok(prompt),
-            Err(error) if count == 0 => return Err(error),
-            Err(_) => {}
-        }
-    }
-    unreachable!("the candidate with no origin entries is always checked")
+// Every value uses the same reversible ASCII notation, without outer quotes.
+// askpass applies its own argument quoting to command/path values afterwards.
+fn display_value(value: &OsStr) -> String {
+    let quoted = quote(value);
+    quoted[1..quoted.len() - 1].to_owned()
 }
 
-fn fit_prompt(prompt: &str) -> Result<String, String> {
-    if prompt.len() > MAX_PROMPT_BYTES {
-        return Err(format!(
-            "request needs {} prompt bytes; v1 permits at most {MAX_PROMPT_BYTES}; refusing to truncate",
-            prompt.len()
-        ));
+pub fn review_arguments(request: &Request, facts: &Facts) -> Result<Vec<String>, String> {
+    let mut args = vec![
+        "--review".into(),
+        "--reason".into(),
+        display_value(&request.description),
+    ];
+    for argument in &request.command {
+        args.extend(["--command-arg".into(), display_value(argument)]);
     }
-    let wrapped = prompt
-        .lines()
-        .flat_map(|line| {
-            if line.is_empty() {
-                vec![String::new()]
-            } else {
-                line.as_bytes()
-                    .chunks(PROMPT_COLUMNS)
-                    .map(|part| String::from_utf8(part.to_vec()).expect("prompt is ASCII"))
-                    .collect()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    if wrapped.lines().count() > MAX_PROMPT_LINES {
-        return Err(format!(
-            "request exceeds the {MAX_PROMPT_LINES}-line display budget; refusing to truncate"
-        ));
+    args.extend([
+        "--working-directory".into(),
+        display_value(facts.cwd.as_os_str()),
+        "--requesting-user".into(),
+        facts
+            .username
+            .as_deref()
+            .map(display_value)
+            .unwrap_or_else(|| "unavailable".into()),
+        "--requesting-uid".into(),
+        facts.uid.to_string(),
+        "--run-as-user".into(),
+        "root".into(),
+    ]);
+    for origin in &facts.origin {
+        args.extend([
+            "--origin".into(),
+            format!("{}:{}", origin.pid, display_value(&origin.executable)),
+        ]);
     }
-    Ok(wrapped)
+    validate_review(&args)?;
+    Ok(args)
 }
 
-pub fn find_zenity() -> Result<PathBuf, String> {
+// Length-prefixed UTF-8 fields preserve empty arguments and all delimiters.
+// No shell, file, or password is involved in this transport.
+pub fn encode_review(args: &[String]) -> Result<String, String> {
+    validate_review(args)?;
+    let mut encoded = String::new();
+    for arg in args {
+        write!(encoded, "{}:{arg}", arg.len()).unwrap();
+    }
+    Ok(encoded)
+}
+
+pub fn decode_review(encoded: &str) -> Result<Vec<String>, String> {
+    // At most one length prefix per option/value byte, plus the --review field.
+    if encoded.len() > MAX_REVIEW_BYTES * 3 {
+        return Err("review transport is too large".into());
+    }
+    let mut rest = encoded;
+    let mut args = Vec::new();
+    while !rest.is_empty() {
+        let (length, tail) = rest.split_once(':').ok_or("invalid review transport")?;
+        if length.is_empty() || !length.bytes().all(|b| b.is_ascii_digit()) {
+            return Err("invalid review field length".into());
+        }
+        let length: usize = length.parse().map_err(|_| "invalid review field length")?;
+        let value = tail.get(..length).ok_or("invalid review field boundary")?;
+        args.push(value.to_owned());
+        rest = &tail[length..];
+    }
+    validate_review(&args)?;
+    Ok(args)
+}
+
+fn validate_review(args: &[String]) -> Result<(), String> {
+    if args.iter().map(String::len).sum::<usize>() > MAX_REVIEW_BYTES {
+        return Err("review exceeds askpass's 16 KiB budget; refusing to truncate".into());
+    }
+    if args.first().map(String::as_str) != Some("--review") || args.len() % 2 != 1 {
+        return Err("invalid review arguments".into());
+    }
+    let mut seen = HashSet::new();
+    let mut command_count = 0;
+    for pair in args[1..].chunks_exact(2) {
+        let option = pair[0].as_str();
+        let value = &pair[1];
+        match option {
+            "--command-arg" => {
+                if command_count == 0 && value.is_empty() {
+                    return Err("empty executable".into());
+                }
+                command_count += 1;
+            }
+            "--origin" => {
+                let (pid, executable) = value.split_once(':').ok_or("invalid origin")?;
+                if pid.parse::<u32>().ok().filter(|&n| n != 0).is_none()
+                    || !pid.bytes().all(|b| b.is_ascii_digit())
+                    || executable.is_empty()
+                {
+                    return Err("invalid origin".into());
+                }
+            }
+            "--reason"
+            | "--working-directory"
+            | "--requesting-user"
+            | "--requesting-uid"
+            | "--run-as-user" => {
+                if !seen.insert(option)
+                    || value.is_empty()
+                    || (option == "--reason" && value.trim().is_empty())
+                {
+                    return Err(format!("missing or duplicate value for {option}"));
+                }
+                if option == "--requesting-uid"
+                    && (!value.bytes().all(|b| b.is_ascii_digit()) || value.parse::<u32>().is_err())
+                {
+                    return Err("invalid requesting UID".into());
+                }
+                if option == "--run-as-user" && value != "root" {
+                    return Err("run-as user must be root".into());
+                }
+            }
+            _ => return Err(format!("unsupported review option: {option}")),
+        }
+    }
+    if seen.len() != 5 || command_count == 0 {
+        return Err("incomplete review".into());
+    }
+    Ok(())
+}
+
+pub fn find_askpass() -> Result<PathBuf, String> {
     let executable = |path: &PathBuf| {
         fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
     };
-    if let Some(path) = std::env::var_os("APPROVE_ZENITY") {
+    if let Some(path) = std::env::var_os("APPROVE_ASKPASS") {
         let path = PathBuf::from(path);
         if path.is_absolute() && executable(&path) {
             return Ok(path);
         }
         return Err(
-            "APPROVE_ZENITY must be an absolute path to an executable Zenity binary".into(),
+            "APPROVE_ASKPASS must be an absolute path to an executable askpass binary".into(),
         );
     }
     std::env::var_os("PATH")
         .and_then(|path| {
             std::env::split_paths(&path)
-                .map(|dir| dir.join("zenity"))
+                .map(|dir| dir.join("askpass"))
                 .find(executable)
         })
         .and_then(|path| fs::canonicalize(path).ok())
-        .ok_or_else(|| {
-            "zenity is not on PATH; enter nix develop or set APPROVE_ZENITY to its absolute path"
-                .into()
-        })
+        .ok_or_else(|| "askpass is not on PATH; install askpass v0.1 or set APPROVE_ASKPASS to its absolute path".into())
 }
 
-// Zenity 4.2.2 entry labels apply g_strcompress and GTK mnemonic handling.
-// Protect backslashes first and double underscores; markup is plain label text.
-pub fn zenity_text(prompt: &str) -> String {
-    prompt.replace('\\', "\\\\").replace('_', "__")
-}
-
-pub fn sudo_command(request: &Request, prompt: &str) -> Command {
+pub fn sudo_command(request: &Request) -> Command {
     let mut command = Command::new("sudo");
     command
-        .args(["-k", "-A", "-p"])
-        .arg(prompt.replace('%', "%%"));
-    command.arg("--").args(&request.command);
+        .args(["-k", "-A", "-p", "Password: ", "--"])
+        .args(&request.command);
     command
 }

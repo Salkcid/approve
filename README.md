@@ -1,38 +1,50 @@
 # approve
 
 A CLI wrapper for reviewing an agent's explanation and observed execution facts
-together with password entry in a Zenity dialog. See [SPEC.md](SPEC.md) for the
+together with password entry in an askpass dialog. See [SPEC.md](SPEC.md) for the
 v1 design.
 
 This is a Linux desktop tool for a local user whose sudo policy requires a
-password. It needs `sudo`, Zenity, and a graphical session. The approval dialog
-shows the submitted arguments and a snapshot of the calling process; it cannot
+password. It needs `sudo`, [askpass v0.1](https://github.com/Salkcid/askpass),
+and a Wayland session. The approval dialog shows the submitted arguments and a snapshot of the calling process; it cannot
 verify the full behavior of a script or a mutable executable.
 
-The project-local `approve-askpass` adapter uses Zenity's hidden-entry dialog.
-Zenity 4.2.2's password dialog ignores `--text`, so it cannot show the review
-details. Only the sudo child receives the adapter's `SUDO_ASKPASS`;
-global sudo and SSH askpass settings are untouched. The adapter executes Zenity
-directly, leaving password handling to Zenity and sudo.
+The project-local `approve-askpass` adapter executes `askpass --review` with
+structured request fields. Only the sudo child receives `SUDO_ASKPASS`,
+`APPROVE_ASKPASS`, and a length-prefixed review in `APPROVE_REVIEW`; global sudo
+and SSH askpass settings are untouched. The adapter removes the review transport
+from the dialog's environment and replaces itself with askpass. Password output
+flows directly from askpass into sudo's pipe.
 
 ## Install and use
 
-Install both binaries from a checkout with Rust and Cargo available:
+Build askpass separately in its GTK 4 development environment, then install both
+approve binaries from this checkout with Rust and Cargo available:
 
 ```sh
+cd ~/projects/askpass
+nix develop -c cargo build --release
+cd ~/projects/approve
 cargo install --locked --path .
+```
+
+Put `askpass` on `PATH`, or set `APPROVE_ASKPASS` to its absolute executable path.
+For example, use the sibling checkout directly:
+
+```sh
+export APPROVE_ASKPASS="$HOME/projects/askpass/target/release/askpass"
 approve -d 'Show the current user' -- id
 ```
 
 The example requests sudo approval. Callers omit `sudo` and pass command
-arguments after `--`; an explicit shell is needed for shell syntax. Zenity must
-be on `PATH`, or set `APPROVE_ZENITY` to its absolute executable path.
+arguments after `--`; an explicit shell is needed for shell syntax. See askpass’s
+README for the optional Niri floating-window rule.
 
 ## Development
 
 The development environment uses stable Rust packages from nixpkgs, pinned by
 `flake.lock`. Nix supplies `rustc`, `cargo`, `rustfmt`, `clippy`, `rust-analyzer`,
-Zenity, and the default compiler/linker support from `pkgs.mkShell`.
+and the default compiler/linker support from `pkgs.mkShell`.
 
 With Nix, direnv, and nix-direnv installed, enter the project directory and trust
 the reviewed `.envrc` once:
@@ -56,19 +68,26 @@ cargo clippy --all-targets -- -D warnings
 ./target/debug/approve -d 'Show the current user' -- id
 ```
 
-Quoted display values escape control characters, non-ASCII characters, and
-invalid UTF-8 bytes. The submitted argument bytes are passed unchanged to sudo.
-Prompts wrap at 100 columns and are rejected above a conservative 4096-byte /
-40-line budget. The process snapshot includes the caller and up to two ancestors;
-origin entries that do not fit are omitted with a notice, preserving the full
-request details. These limits still require checking the dialog on the intended
-desktop and display scaling.
+Display values use reversible ASCII notation: backslashes, quotes, control
+characters, non-ASCII characters, and invalid UTF-8 bytes are escaped. Askpass
+additionally quotes command and path values, so those fields show another layer
+of backslash escaping. The original command argument bytes are passed unchanged
+to sudo. Requests exceeding askpass v0.1's 16 KiB option/value budget are rejected
+before sudo runs; no values are truncated. The scrollable dialog replaces the
+old fixed line and width limits.
 
-The automated tests use stand-ins for sudo and Zenity; they require no root
-access, GUI interaction, or passwords. They cover argument and stream
-preservation, exit status, prompt escaping, size rejection, and adapter
-cancellation. Real authentication and dialog layout require manual checks on
-the intended desktop, outside sandboxes that set `NoNewPrivs`.
+The process snapshot includes at most the caller and two ancestors, nearest
+first. Collection stops when the parent is unavailable or outside the PID
+namespace; inaccessible executable paths are marked unavailable. This is a
+bounded snapshot, not a complete ancestry report. All collected entries must fit
+the request budget.
+
+The automated tests use stand-ins for sudo and askpass; they require no root
+access, GUI interaction, or passwords. They cover structured transport, exact
+budget boundaries, argument and stream preservation, exit status, malformed
+requests, executable lookup, and cancellation through the adapter. Real
+authentication and dialog layout require manual checks in a Wayland session,
+outside sandboxes that set `NoNewPrivs`.
 
 For a harmless manual acceptance check, run from the development shell:
 

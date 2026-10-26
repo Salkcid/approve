@@ -20,7 +20,6 @@
               rustfmt
               clippy
               rust-analyzer
-              zenity
             ];
           };
         });

@@ -1,31 +1,20 @@
-use approve::{MAX_PROMPT_LINES, PROMPT_COLUMNS, find_zenity, zenity_text};
+use approve::{REVIEW_ENV, decode_review, find_askpass};
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 
 fn run() -> Result<(), String> {
-    let mut args = std::env::args().skip(1);
-    let prompt = args.next().ok_or("expected one sudo prompt argument")?;
-    if args.next().is_some()
-        || prompt.is_empty()
-        || !prompt.is_ascii()
-        || prompt.lines().count() > MAX_PROMPT_LINES
-        || prompt.lines().any(|line| line.len() > PROMPT_COLUMNS)
-        || prompt.chars().any(|c| c.is_control() && c != '\n')
-    {
-        return Err("invalid or oversized prompt".into());
+    // sudo supplies one prompt. Review data comes only from our transport.
+    let mut args = std::env::args_os().skip(1);
+    if args.next().is_none() || args.next().is_some() {
+        return Err("expected one sudo prompt argument".into());
     }
-    let error = Command::new(find_zenity()?)
-        .args([
-            "--entry",
-            "--hide-text",
-            "--title=Administrator access requested",
-            "--ok-label=Authorize",
-            "--cancel-label=Cancel",
-            "--width=820",
-        ])
-        .arg(format!("--text={}", zenity_text(&prompt)))
+    let encoded = std::env::var(REVIEW_ENV).map_err(|_| "missing or non-UTF-8 review transport")?;
+    let review = decode_review(&encoded)?;
+    let error = Command::new(find_askpass()?)
+        .args(review)
+        .env_remove(REVIEW_ENV)
         .exec();
-    Err(format!("could not execute Zenity: {error}"))
+    Err(format!("could not execute askpass: {error}"))
 }
 
 fn main() {

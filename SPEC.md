@@ -1,7 +1,7 @@
 # approve v1
 
 A CLI wrapper that lets the user review an agent's explanation and independently
-collected execution facts together with password entry in a Zenity dialog.
+collected execution facts together with password entry in an askpass dialog.
 
 ## Interface
 
@@ -26,11 +26,11 @@ Clearly separate **caller-provided explanation** from **observed facts**:
 
 Do not accept caller-supplied origin labels as facts. Mark inaccessible or missing
 ancestry information as unavailable; do not infer an application identity.
-Ancestry is supporting context: show the immediate caller and at most two further
-ancestors, nearest first. Omit whole origin entries when necessary to fit the
-dialog and explicitly disclose omissions. Preserve the full explanation,
-command, working directory, and calling user; reject if those required details
-and the omission notice cannot fit.
+Ancestry is supporting context: collect the immediate caller and at most two
+further ancestors, nearest first. Stop at inaccessible parents or PID namespace
+boundaries. Mark an inaccessible executable as unavailable. The bounded snapshot
+is not a complete ancestry report. Preserve all collected entries and required
+request details; reject the request if they exceed the backend's budget.
 Escape control characters and display content literally. Never silently truncate
 the command; reject requests that cannot be displayed adequately.
 
@@ -62,25 +62,27 @@ Password: [                              ]
 ## Authorization and execution
 
 - Use a project-local `approve-askpass` adapter, selected through `SUDO_ASKPASS`
-  for this sudo invocation only. The adapter executes Zenity's hidden-entry
-  dialog with the context and password field together. The installed Zenity
-  4.2.2 `--password` dialog ignores `--text`, so the installed helper cannot
-  provide the required context display.
-- Build a combined context/password prompt and invoke
-  `sudo -k -A -p <prompt> -- <command> <arguments...>`.
-- Escape literal `%` characters for sudo's prompt substitution rules.
-- Protect backslashes and underscores from Zenity's escape and mnemonic
-  processing. Its hidden-entry label displays markup-like text literally.
-- Quote values with ASCII display notation: `\n`, `\r`, `\t`, `\\`, `\"`,
-  `\u{...}` for other control and non-ASCII characters, and `\xNN` for invalid
-  UTF-8 bytes. Wrap display lines at 100 columns and reject prompts over 4096
-  bytes before wrapping or 40 lines after wrapping; never truncate values.
+  for this sudo invocation only. Resolve the separate askpass v0.1 executable
+  from `PATH` or an absolute executable `APPROVE_ASKPASS` override before sudo.
+- Invoke `sudo -k -A -p 'Password: ' -- <command> <arguments...>`. Review data
+  does not use sudo's prompt substitution mechanism.
+- Pass structured `--review` arguments through child-only `APPROVE_REVIEW` as
+  length-prefixed UTF-8 fields. Validate the transport and fields in the adapter,
+  then execute askpass directly with an argument array and remove the transport
+  from the dialog's environment. Never interpret data as shell code.
+- Convert display values to reversible ASCII notation without outer quotes:
+  `\n`, `\r`, `\t`, `\\`, `\"`, `\u{...}` for control/non-ASCII characters,
+  and `\xNN` for invalid UTF-8 bytes. Askpass applies its own quoting to command
+  and path fields, adding a further display escaping layer.
+- Reject requests whose option names and values exceed askpass v0.1's 16 KiB
+  UTF-8 byte budget. Preserve argument boundaries, including empty arguments and
+  values beginning with dashes. The dialog scrolls; no fixed line limit applies.
 - Use the same command argument array for display and execution. Preserve the
   working directory and standard streams, subject to sudo's normal policy.
 - Password submission authorizes the request; sudo verifies the password.
   Cancellation or authentication failure must prevent command execution.
 - The CLI must not collect, store, or log passwords. The adapter replaces itself
-  with Zenity; password output flows directly from Zenity to sudo's askpass pipe.
+  with askpass; password output flows directly from askpass to sudo's askpass pipe.
   Return sudo's exit status.
 - Do not change global sudo configuration, replace SSH askpass, or add a second
   confirmation dialog. `-k` bypasses cached credentials for this invocation.
@@ -94,12 +96,11 @@ Password: [                              ]
 - Display the submitted command, not a claim about sudo's resolved executable or
   the complete behavior of scripts, shells, or mutable files.
 - No sudo plugin, custom GUI implementation, or agent conversation integration
-  in v1. The adapter uses the existing Zenity hidden-entry dialog.
-- Require `approve-askpass` beside the CLI and Zenity on `PATH` (or an absolute
-  executable path in `APPROVE_ZENITY`). Local usernames come from `/etc/passwd`;
-  missing names are reported as unavailable. Ancestry is a best-effort Linux
-  `/proc` snapshot, limited to the caller plus two ancestors with any remaining
-  chain disclosed. Origin details also share the remaining display budget.
+  in v1. The dialog backend is the separate askpass executable.
+- Require `approve-askpass` beside the CLI, askpass v0.1 on `PATH` (or an absolute
+  executable path in `APPROVE_ASKPASS`), and a Wayland session. Local usernames
+  come from `/etc/passwd`; missing names are reported as unavailable. Ancestry is
+  a best-effort Linux `/proc` snapshot limited to the caller plus two ancestors.
 
 ## Acceptance checks
 

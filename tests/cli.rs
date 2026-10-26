@@ -20,8 +20,11 @@ impl Fixture {
         fs::create_dir(&path).unwrap();
         let fixture = Self(path);
         fixture.script(
-            "zenity",
-            "printf '%s\\0' \"$@\" > \"$ZENITY_ARGS\"\nexit 1\n",
+            "askpass",
+            concat!(
+                "[ \"${APPROVE_REVIEW+x}\" != x ] || exit 99\n",
+                "printf '%s\\0' \"$@\" > \"$ASKPASS_ARGS\"\nexit 1\n"
+            ),
         );
         fixture.script(
             "sudo",
@@ -29,6 +32,7 @@ impl Fixture {
                 "printf '%s\\0' \"$@\" > \"$SUDO_ARGS\"\n",
                 "printf '%s' \"$SUDO_ASKPASS\" > \"$HELPER_PATH\"\n",
                 "if [ \"${DENY:-0}\" = 1 ]; then exit 1; fi\n",
+                "printf '%s' \"$APPROVE_REVIEW\" > review\n",
                 "shift 5\nexec \"$@\"\n"
             ),
         );
@@ -46,9 +50,9 @@ impl Fixture {
         command
             .current_dir(&self.0)
             .env("PATH", &self.0)
-            .env("APPROVE_ZENITY", self.0.join("zenity"))
+            .env("APPROVE_ASKPASS", self.0.join("askpass"))
             .env("SUDO_ARGS", self.0.join("sudo-args"))
-            .env("ZENITY_ARGS", self.0.join("zenity-args"))
+            .env("ASKPASS_ARGS", self.0.join("askpass-args"))
             .env("HELPER_PATH", self.0.join("helper"))
             .env("TARGET_ARGS", self.0.join("target-args"))
             .env("PWD", "/caller-supplied-fake-directory")
@@ -98,12 +102,18 @@ fn preserves_execution_arguments_cwd_streams_and_status() {
     assert_eq!(fixture.args("target-args"), values);
     let sudo = fixture.args("sudo-args");
     assert_eq!(&sudo[..3], &["-k", "-A", "-p"]);
-    let prompt = sudo[3].to_str().unwrap();
-    assert!(prompt.contains("%%u"));
-    assert!(prompt.contains(&approve::quote(fixture.0.as_os_str())));
-    assert!(!prompt.contains("caller-supplied-fake"));
-    assert!(prompt.contains("caller PID"));
-    assert!(prompt.contains("Run as: root"));
+    assert_eq!(sudo[3], "Password: ");
+    let review =
+        approve::decode_review(&fs::read_to_string(fixture.0.join("review")).unwrap()).unwrap();
+    assert!(review.contains(&"test %u <b>_reason_</b>".into()));
+    assert!(review.contains(&fixture.0.to_str().unwrap().to_owned()));
+    assert!(
+        !review
+            .iter()
+            .any(|value| value.contains("caller-supplied-fake"))
+    );
+    assert!(review.contains(&"--origin".into()));
+    assert!(review.contains(&"root".into()));
     assert_eq!(sudo[4], "--");
     assert_eq!(sudo[5], "/bin/sh");
     assert_eq!(&sudo[sudo.len() - values.len()..], &values);
@@ -152,7 +162,7 @@ fn invalid_and_oversized_requests_never_invoke_sudo() {
     }
     let output = fixture
         .command(env!("CARGO_BIN_EXE_approve"))
-        .args(["-d", "large", "--", "id", &"x".repeat(5000)])
+        .args(["-d", "large", "--", "id", &"x".repeat(17000)])
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
@@ -161,22 +171,23 @@ fn invalid_and_oversized_requests_never_invoke_sudo() {
 }
 
 #[test]
-fn adapter_escapes_zenity_processing_and_propagates_cancellation() {
+fn adapter_passes_structured_values_and_propagates_cancellation() {
     let fixture = Fixture::new();
-    let prompt = "Command:\n  \"<b>_text_ & \\n %u</b>\"\nPassword: ";
+    let review = sample_review();
     let output = fixture
         .command(env!("CARGO_BIN_EXE_approve-askpass"))
-        .arg(prompt)
+        .env(
+            approve::REVIEW_ENV,
+            approve::encode_review(&review).unwrap(),
+        )
+        .arg("ignored sudo prompt %u")
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
-    let args = fixture.args("zenity-args");
-    assert!(args.contains(&OsString::from("--hide-text")));
-    assert!(args.contains(&OsString::from("--entry")));
     assert_eq!(
-        args.last().unwrap(),
-        "--text=Command:\n  \"<b>__text__ & \\\\n %u</b>\"\nPassword: "
+        fixture.args("askpass-args"),
+        review.iter().map(OsString::from).collect::<Vec<_>>()
     );
 }
 
@@ -210,7 +221,13 @@ fn complete_adapter_path_cancels_or_executes_without_cli_reading_its_output() {
     assert_eq!(cancelled.status.code(), Some(1));
     assert!(cancelled.stdout.is_empty());
     assert!(!fixture.0.join("marker").exists());
-    fixture.script("zenity", "printf fixture-authorization\n");
+    fixture.script(
+        "askpass",
+        concat!(
+            "[ \"${APPROVE_REVIEW+x}\" != x ] || exit 99\n",
+            "printf 'fixture-authorization\\n'\n"
+        ),
+    );
     let allowed = run();
     assert_eq!(allowed.status.code(), Some(18));
     assert_eq!(allowed.stdout, b"result");
@@ -218,22 +235,25 @@ fn complete_adapter_path_cancels_or_executes_without_cli_reading_its_output() {
 }
 
 #[test]
-fn adapter_rejects_prompts_it_cannot_display() {
+fn adapter_rejects_missing_malformed_and_oversized_transport() {
     let fixture = Fixture::new();
-    for prompt in [
-        "bad\u{1b}control".to_string(),
-        "é".to_string(),
-        "x".repeat(approve::PROMPT_COLUMNS + 1),
-        "line\n".repeat(approve::MAX_PROMPT_LINES + 1),
+    for encoded in [
+        None,
+        Some("".into()),
+        Some("99:short".into()),
+        Some("1:é".into()),
+        Some("0:".repeat(25000)),
+        Some("8:--review".into()),
     ] {
-        let output = fixture
-            .command(env!("CARGO_BIN_EXE_approve-askpass"))
-            .arg(prompt)
-            .output()
-            .unwrap();
+        let mut command = fixture.command(env!("CARGO_BIN_EXE_approve-askpass"));
+        command.env_remove(approve::REVIEW_ENV).arg("Password: ");
+        if let Some(encoded) = encoded {
+            command.env(approve::REVIEW_ENV, encoded);
+        }
+        let output = command.output().unwrap();
         assert_eq!(output.status.code(), Some(1));
         assert!(output.stdout.is_empty());
-        assert!(!fixture.0.join("zenity-args").exists());
+        assert!(!fixture.0.join("askpass-args").exists());
     }
 }
 
@@ -254,110 +274,117 @@ fn quote_distinguishes_raw_bytes_controls_and_literal_escapes() {
     );
 }
 
+fn sample_review() -> Vec<String> {
+    [
+        "--review",
+        "--reason",
+        "Review <b>_literal_</b> %u",
+        "--command-arg",
+        "echo",
+        "--command-arg",
+        "",
+        "--command-arg",
+        "--help",
+        "--command-arg",
+        "line\nbreak:é",
+        "--working-directory",
+        "/test",
+        "--requesting-user",
+        "local-user",
+        "--requesting-uid",
+        "1000",
+        "--run-as-user",
+        "root",
+        "--origin",
+        "12:/bin/sh",
+    ]
+    .map(String::from)
+    .to_vec()
+}
+
 #[test]
-fn prompt_wraps_without_losing_any_content() {
-    let request =
-        approve::Request::parse(["-d", "wrap", "--", "echo", &"x".repeat(250)].map(OsString::from))
-            .unwrap();
-    let facts = approve::Facts {
-        cwd: "/test".into(),
-        uid: 1000,
-        username: None,
-        origin: vec!["unavailable".into()],
-    };
-    let prompt = approve::render_prompt(&request, &facts).unwrap();
-    assert!(
-        prompt
-            .lines()
-            .all(|line| line.len() <= approve::PROMPT_COLUMNS)
+fn transport_preserves_empty_values_delimiters_and_unicode() {
+    let args = sample_review();
+    assert_eq!(
+        approve::decode_review(&approve::encode_review(&args).unwrap()).unwrap(),
+        args
     );
-    assert!(prompt.replace('\n', "").contains(&"x".repeat(250)));
-    assert!(prompt.contains("Calling user: unavailable (UID 1000)"));
+    for pair in [
+        ["--unknown", "x"],
+        ["--reason", "duplicate"],
+        ["--origin", "0:/bad"],
+    ] {
+        let mut invalid = args.clone();
+        invalid.extend(pair.map(String::from));
+        assert!(approve::encode_review(&invalid).is_err());
+    }
 }
 
 #[test]
-fn origin_yields_to_request_details_at_both_display_limits() {
-    let request = approve::Request::parse(
-        [
-            "-d",
-            "Review this request",
-            "--",
-            "echo",
-            "keep the whole argument",
-        ]
-        .map(OsString::from),
-    )
+fn review_preserves_request_details_and_structured_origins_without_wrapping() {
+    let request = approve::Request::parse([
+        OsString::from("-d"),
+        OsString::from("Review this request"),
+        OsString::from("--"),
+        OsString::from("echo"),
+        OsString::from(""),
+        OsString::from("x".repeat(5000)),
+        OsString::from_vec(vec![0xff]),
+        OsString::from("\\xff"),
+    ])
     .unwrap();
-    // The first case exceeds the line budget after wrapping; the second also
-    // exceeds the byte budget. Neither should invalidate the short request.
-    for length in [2500, 5000] {
-        let mut facts = approve::Facts {
-            cwd: "/test".into(),
-            uid: 1000,
-            username: Some("local-user".into()),
-            origin: vec![
-                "caller PID 12: \"/bin/sh\"".into(),
-                format!("ancestor PID 11: \"/{}\"", "x".repeat(length)),
-                "ancestor PID 10: \"/bin/older\"".into(),
-            ],
-        };
-        let prompt = approve::render_prompt(&request, &facts).unwrap();
-        assert!(prompt.contains("caller PID 12"));
-        assert!(!prompt.contains("ancestor PID"));
-        assert!(prompt.contains("omitted to fit the dialog"));
-        assert!(prompt.contains("\"Review this request\""));
-        assert!(prompt.contains("\"echo\" \"keep the whole argument\""));
-        assert!(prompt.contains("\"/test\""));
-        assert!(prompt.contains("Calling user: \"local-user\" (UID 1000)"));
-        assert!(prompt.lines().count() <= approve::MAX_PROMPT_LINES);
-        assert!(prompt.len() <= approve::MAX_PROMPT_BYTES);
-
-        // Even an oversized immediate caller is optional supporting context.
-        facts.origin.remove(0);
-        let prompt = approve::render_prompt(&request, &facts).unwrap();
-        assert!(!prompt.contains("ancestor PID"));
-        assert!(prompt.contains("omitted to fit the dialog"));
-    }
-}
-
-#[test]
-fn oversized_required_details_are_rejected_even_without_origin() {
     let facts = approve::Facts {
         cwd: "/test".into(),
         uid: 1000,
         username: None,
-        origin: Vec::new(),
+        origin: vec![approve::Origin {
+            pid: 12,
+            executable: "/bin/sh:with:colons".into(),
+        }],
     };
-    for length in [2500, 5000] {
-        let argument = "x".repeat(length);
-        let request =
-            approve::Request::parse(["-d", "test", "--", "echo", &argument].map(OsString::from))
-                .unwrap();
-        assert!(
-            approve::render_prompt(&request, &facts)
-                .unwrap_err()
-                .contains("refusing to truncate")
-        );
-    }
+    let args = approve::review_arguments(&request, &facts).unwrap();
+    assert!(args.contains(&"x".repeat(5000)));
+    assert!(args.contains(&"12:/bin/sh:with:colons".into()));
+    assert!(args.contains(&"unavailable".into()));
+    assert!(args.contains(&r"\xff".into()));
+    assert!(args.contains(&r"\\xff".into()));
+    assert_eq!(
+        approve::decode_review(&approve::encode_review(&args).unwrap()).unwrap(),
+        args
+    );
 }
 
 #[test]
-fn origin_is_preserved_when_it_fits() {
-    let request = approve::Request::parse(["-d", "test", "--", "id"].map(OsString::from)).unwrap();
-    let facts = approve::Facts {
-        cwd: "/test".into(),
-        uid: 1000,
-        username: None,
-        origin: vec![
-            "caller PID 12: \"/bin/sh\"".into(),
-            "ancestor PID 11: \"/bin/agent\"".into(),
-            "ancestor PID 10: \"/bin/terminal\"".into(),
-            "Additional ancestors omitted (3-process observation limit).".into(),
-        ],
+fn budget_matches_askpass_option_and_value_bytes() {
+    let mut args = sample_review();
+    let size = args.iter().map(String::len).sum::<usize>();
+    args[2].push_str(&"x".repeat(approve::MAX_REVIEW_BYTES - size));
+    assert!(approve::encode_review(&args).is_ok());
+    args[2].push('x');
+    assert!(
+        approve::encode_review(&args)
+            .unwrap_err()
+            .contains("refusing to truncate")
+    );
+}
+
+#[test]
+fn executable_lookup_supports_path_and_rejects_invalid_override() {
+    let fixture = Fixture::new();
+    let run = |override_path: Option<&Path>| {
+        let mut command = fixture.command(env!("CARGO_BIN_EXE_approve"));
+        command
+            .env_remove("APPROVE_ASKPASS")
+            .args(["-d", "test", "--", "/bin/sh", "-c", "exit 0"]);
+        if let Some(path) = override_path {
+            command.env("APPROVE_ASKPASS", path);
+        }
+        command.output().unwrap()
     };
-    let prompt = approve::render_prompt(&request, &facts).unwrap();
-    for entry in &facts.origin {
-        assert!(prompt.contains(entry));
+    assert!(run(None).status.success());
+    for path in [Path::new("relative"), Path::new("/missing/askpass")] {
+        let output = run(Some(path));
+        assert_eq!(output.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("APPROVE_ASKPASS"));
     }
-    assert!(!prompt.contains("omitted to fit the dialog"));
 }

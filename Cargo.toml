@@ -1,0 +1,9 @@
+[package]
+name = "approve"
+version = "0.1.0"
+edition = "2024"
+description = "Review caller explanations and observed facts in a sudo askpass prompt"
+publish = false
+default-run = "approve"
+
+[dependencies]

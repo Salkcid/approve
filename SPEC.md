@@ -26,6 +26,11 @@ Clearly separate **caller-provided explanation** from **observed facts**:
 
 Do not accept caller-supplied origin labels as facts. Mark inaccessible or missing
 ancestry information as unavailable; do not infer an application identity.
+Ancestry is supporting context: show the immediate caller and at most two further
+ancestors, nearest first. Omit whole origin entries when necessary to fit the
+dialog and explicitly disclose omissions. Preserve the full explanation,
+command, working directory, and calling user; reject if those required details
+and the omission notice cannot fit.
 Escape control characters and display content literally. Never silently truncate
 the command; reject requests that cannot be displayed adequately.
 
@@ -95,7 +100,8 @@ Password: [                              ]
 - Require `approve-askpass` beside the CLI and Zenity on `PATH` (or an absolute
   executable path in `APPROVE_ZENITY`). Local usernames come from `/etc/passwd`;
   missing names are reported as unavailable. Ancestry is a best-effort Linux
-  `/proc` snapshot, limited to 16 ancestors with any remaining chain disclosed.
+  `/proc` snapshot, limited to the caller plus two ancestors with any remaining
+  chain disclosed. Origin details also share the remaining display budget.
 
 ## Acceptance checks
 

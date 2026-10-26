@@ -95,17 +95,11 @@ impl Facts {
             .map_err(|e| format!("cannot read process identity: {e}"))?;
         let uid = status_number(&status, "Uid:").ok_or("calling UID unavailable")?;
         let username = passwd_name(uid);
-        let mut origin = vec![format!(
-            "approve PID {}: {}",
-            std::process::id(),
-            fs::read_link("/proc/self/exe")
-                .map(|p| quote(p.as_os_str()))
-                .unwrap_or_else(|_| "executable unavailable".into())
-        )];
+        let mut origin = Vec::new();
         let mut parent = status_number(&status, "PPid:");
         let mut seen = HashSet::new();
         // Bound observation work; disclose omitted ancestry, never infer identity.
-        for depth in 0..16 {
+        for depth in 0..3 {
             let Some(pid) = parent else {
                 origin.push("parent process information unavailable".into());
                 break;
@@ -126,8 +120,13 @@ impl Facts {
             parent = fs::read_to_string(format!("/proc/{pid}/status"))
                 .ok()
                 .and_then(|s| status_number(&s, "PPid:"));
-            if depth == 15 {
-                origin.push("remaining ancestry unavailable (16-process observation limit)".into());
+            if depth == 2 {
+                match parent {
+                    Some(0) => {}
+                    Some(_) => origin
+                        .push("Additional ancestors omitted (3-process observation limit).".into()),
+                    None => origin.push("parent process information unavailable".into()),
+                }
             }
         }
         Ok(Self {
@@ -163,15 +162,35 @@ pub fn render_prompt(request: &Request, facts: &Facts) -> Result<String, String>
         .as_deref()
         .map(quote)
         .unwrap_or_else(|| "unavailable".into());
-    let prompt = format!(
-        "Administrator access requested\n\nReason supplied by caller:\n  {}\n\nObserved execution facts:\n\nRequested command (quoted arguments):\n  {}\n\nWorking directory:\n  {}\n\nCalling user: {} (UID {})\nRun as: root\n\nOrigin (process snapshot):\n  {}\n\nDisplay lines wrap. Quoted values use backslash escapes; no shell expansion.\n\nPassword: ",
-        quote(&request.description),
-        command,
-        quote(facts.cwd.as_os_str()),
-        username,
-        facts.uid,
-        facts.origin.join("\n  "),
-    );
+    // Prefer the nearest processes, dropping whole entries rather than paths.
+    // Every candidate includes an omission notice when entries are removed.
+    for count in (0..=facts.origin.len()).rev() {
+        let mut origin = facts.origin[..count].join("\n  ");
+        if count < facts.origin.len() {
+            if !origin.is_empty() {
+                origin.push_str("\n  ");
+            }
+            origin.push_str("Additional origin details omitted to fit the dialog.");
+        }
+        let prompt = format!(
+            "Administrator access requested\n\nReason supplied by caller:\n  {}\n\nObserved execution facts:\n\nRequested command (quoted arguments):\n  {}\n\nWorking directory:\n  {}\n\nCalling user: {} (UID {})\nRun as: root\n\nOrigin (process snapshot):\n  {}\n\nDisplay lines wrap. Quoted values use backslash escapes; no shell expansion.\n\nPassword: ",
+            quote(&request.description),
+            command,
+            quote(facts.cwd.as_os_str()),
+            username,
+            facts.uid,
+            origin,
+        );
+        match fit_prompt(&prompt) {
+            Ok(prompt) => return Ok(prompt),
+            Err(error) if count == 0 => return Err(error),
+            Err(_) => {}
+        }
+    }
+    unreachable!("the candidate with no origin entries is always checked")
+}
+
+fn fit_prompt(prompt: &str) -> Result<String, String> {
     if prompt.len() > MAX_PROMPT_BYTES {
         return Err(format!(
             "request needs {} prompt bytes; v1 permits at most {MAX_PROMPT_BYTES}; refusing to truncate",

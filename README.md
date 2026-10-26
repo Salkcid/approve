@@ -46,7 +46,9 @@ both binaries beside each other, use `cargo install --path .`. Zenity must be on
 Quoted display values escape control characters, non-ASCII characters, and
 invalid UTF-8 bytes. The submitted argument bytes are passed unchanged to sudo.
 Prompts wrap at 100 columns and are rejected above a conservative 4096-byte /
-40-line budget. These limits still require checking the dialog on the intended
+40-line budget. The process snapshot includes the caller and up to two ancestors;
+origin entries that do not fit are omitted with a notice, preserving the full
+request details. These limits still require checking the dialog on the intended
 desktop and display scaling.
 
 The automated tests use stand-ins for sudo and Zenity; they require no root

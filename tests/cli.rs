@@ -274,3 +274,90 @@ fn prompt_wraps_without_losing_any_content() {
     assert!(prompt.replace('\n', "").contains(&"x".repeat(250)));
     assert!(prompt.contains("Calling user: unavailable (UID 1000)"));
 }
+
+#[test]
+fn origin_yields_to_request_details_at_both_display_limits() {
+    let request = approve::Request::parse(
+        [
+            "-d",
+            "Review this request",
+            "--",
+            "echo",
+            "keep the whole argument",
+        ]
+        .map(OsString::from),
+    )
+    .unwrap();
+    // The first case exceeds the line budget after wrapping; the second also
+    // exceeds the byte budget. Neither should invalidate the short request.
+    for length in [2500, 5000] {
+        let mut facts = approve::Facts {
+            cwd: "/test".into(),
+            uid: 1000,
+            username: Some("local-user".into()),
+            origin: vec![
+                "caller PID 12: \"/bin/sh\"".into(),
+                format!("ancestor PID 11: \"/{}\"", "x".repeat(length)),
+                "ancestor PID 10: \"/bin/older\"".into(),
+            ],
+        };
+        let prompt = approve::render_prompt(&request, &facts).unwrap();
+        assert!(prompt.contains("caller PID 12"));
+        assert!(!prompt.contains("ancestor PID"));
+        assert!(prompt.contains("omitted to fit the dialog"));
+        assert!(prompt.contains("\"Review this request\""));
+        assert!(prompt.contains("\"echo\" \"keep the whole argument\""));
+        assert!(prompt.contains("\"/test\""));
+        assert!(prompt.contains("Calling user: \"local-user\" (UID 1000)"));
+        assert!(prompt.lines().count() <= approve::MAX_PROMPT_LINES);
+        assert!(prompt.len() <= approve::MAX_PROMPT_BYTES);
+
+        // Even an oversized immediate caller is optional supporting context.
+        facts.origin.remove(0);
+        let prompt = approve::render_prompt(&request, &facts).unwrap();
+        assert!(!prompt.contains("ancestor PID"));
+        assert!(prompt.contains("omitted to fit the dialog"));
+    }
+}
+
+#[test]
+fn oversized_required_details_are_rejected_even_without_origin() {
+    let facts = approve::Facts {
+        cwd: "/test".into(),
+        uid: 1000,
+        username: None,
+        origin: Vec::new(),
+    };
+    for length in [2500, 5000] {
+        let argument = "x".repeat(length);
+        let request =
+            approve::Request::parse(["-d", "test", "--", "echo", &argument].map(OsString::from))
+                .unwrap();
+        assert!(
+            approve::render_prompt(&request, &facts)
+                .unwrap_err()
+                .contains("refusing to truncate")
+        );
+    }
+}
+
+#[test]
+fn origin_is_preserved_when_it_fits() {
+    let request = approve::Request::parse(["-d", "test", "--", "id"].map(OsString::from)).unwrap();
+    let facts = approve::Facts {
+        cwd: "/test".into(),
+        uid: 1000,
+        username: None,
+        origin: vec![
+            "caller PID 12: \"/bin/sh\"".into(),
+            "ancestor PID 11: \"/bin/agent\"".into(),
+            "ancestor PID 10: \"/bin/terminal\"".into(),
+            "Additional ancestors omitted (3-process observation limit).".into(),
+        ],
+    };
+    let prompt = approve::render_prompt(&request, &facts).unwrap();
+    for entry in &facts.origin {
+        assert!(prompt.contains(entry));
+    }
+    assert!(!prompt.contains("omitted to fit the dialog"));
+}

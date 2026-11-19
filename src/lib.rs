@@ -238,7 +238,8 @@ pub fn decode_review(encoded: &str) -> Result<Vec<String>, String> {
     let mut args = Vec::new();
     while !rest.is_empty() {
         let (length, tail) = rest.split_once(':').ok_or("invalid review transport")?;
-        if length.is_empty() || !length.bytes().all(|b| b.is_ascii_digit()) {
+        // parse() also accepts a leading '+'; an empty length fails parse() below.
+        if !length.bytes().all(|b| b.is_ascii_digit()) {
             return Err("invalid review field length".into());
         }
         let length: usize = length.parse().map_err(|_| "invalid review field length")?;

@@ -562,7 +562,7 @@ fn adapter_rejects_invalid_framing_non_utf8_and_wrong_prompt_count() {
             &fixture,
             OsStr::new(&valid),
             &prompts,
-            "expected one sudo prompt",
+            "expected one prompt argument",
         );
     }
 }
@@ -570,6 +570,7 @@ fn adapter_rejects_invalid_framing_non_utf8_and_wrong_prompt_count() {
 #[test]
 fn review_has_exact_ordered_fields_and_reversible_display_values() {
     let request = approve::Request {
+        mode: approve::Mode::Sudo,
         description: "reason\n\"é".into(),
         command: vec![
             "echo".into(),
@@ -659,6 +660,7 @@ fn escaping_can_exceed_budget_before_sudo_runs() {
 #[test]
 fn all_origins_are_preserved_and_count_toward_the_exact_budget() {
     let mut request = approve::Request {
+        mode: approve::Mode::Sudo,
         description: "reason".into(),
         command: vec!["echo".into()],
     };
@@ -804,4 +806,196 @@ fn startup_failures_report_errors_without_running_the_target() {
     assert!(output.stdout.is_empty());
     assert!(String::from_utf8_lossy(&output.stderr).contains("could not execute askpass"));
     assert!(!fixture.0.join("askpass-args").exists());
+}
+
+#[test]
+fn ssh_mode_runs_directly_and_reviews_each_prompt_separately() {
+    let fixture = Fixture::new();
+    fixture.script(
+        "askpass",
+        concat!(
+            "[ \"${APPROVE_REVIEW+x}\" != x ] || exit 99\n",
+            "printf '%s\\0' \"$@\" > \"$ASKPASS_ARGS\"\n",
+            "printf 'fixture-passphrase\\n'\n"
+        ),
+    );
+    // A protocol stand-in for ssh: two keys, each prompting through SSH_ASKPASS.
+    fixture.script(
+        "ssh",
+        concat!(
+            "printf '%s|%s|%s' \"$SSH_ASKPASS_REQUIRE\" \"${SUDO_ASKPASS-unset}\" ",
+            "\"$SSH_ASKPASS\" > ssh-env\n",
+            "printf '%s' $$ > ssh-pid\n",
+            "for key in one two; do\n",
+            "  reply=$(ASKPASS_ARGS=\"$PWD/askpass-$key\" \"$SSH_ASKPASS\" ",
+            "\"Enter passphrase for key '/keys/$key': \") || exit 41\n",
+            "  [ \"$reply\" = fixture-passphrase ] || exit 42\n",
+            "done\n",
+            "printf '%s\\0' \"$@\" > \"$TARGET_ARGS\"\nexit 23\n"
+        ),
+    );
+    let output = fixture
+        .command(env!("CARGO_BIN_EXE_approve"))
+        // ssh mode must not introduce a sudo askpass of its own.
+        .env_remove("SUDO_ASKPASS")
+        .args([
+            "--ssh",
+            "-d",
+            "Test GitHub auth",
+            "--",
+            "ssh",
+            "-T",
+            "git@example.com",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(23), "{output:?}");
+    assert_eq!(fixture.args("target-args"), ["-T", "git@example.com"]);
+    assert!(!fixture.0.join("sudo-args").exists());
+    assert_eq!(
+        fs::read_to_string(fixture.0.join("ssh-env")).unwrap(),
+        format!("force|unset|{}", env!("CARGO_BIN_EXE_approve-askpass"))
+    );
+    let ssh_pid = fs::read_to_string(fixture.0.join("ssh-pid")).unwrap();
+    for key in ["one", "two"] {
+        let review: Vec<String> = fixture
+            .args(&format!("askpass-{key}"))
+            .into_iter()
+            .map(|arg| arg.into_string().unwrap())
+            .collect();
+        assert_eq!(&review[..3], ["--review", "--kind", "ssh"]);
+        assert!(review.contains(&"Test GitHub auth".into()));
+        assert!(!review.contains(&"--run-as-user".into()));
+        let tail = &review[review.len() - 4..];
+        assert_eq!(tail[0], "--prompt");
+        assert_eq!(tail[1], format!("Enter passphrase for key '/keys/{key}': "));
+        assert_eq!(tail[2], "--prompt-process");
+        let (pid, exe) = tail[3].split_once(':').unwrap();
+        assert_eq!(pid, ssh_pid);
+        assert!(Path::new(exe).is_absolute(), "{exe}");
+        // Each call contributes exactly one prompt.
+        assert_eq!(review.iter().filter(|arg| *arg == "--prompt").count(), 1);
+    }
+}
+
+#[test]
+fn ssh_cancellation_reaches_ssh_and_the_failure_status_is_returned() {
+    let fixture = Fixture::new();
+    fixture.script(
+        "ssh",
+        "\"$SSH_ASKPASS\" 'Enter passphrase: ' > /dev/null || exit 255\nexit 0\n",
+    );
+    let output = fixture
+        .command(env!("CARGO_BIN_EXE_approve"))
+        .args(["--ssh", "-d", "cancel", "--", "ssh", "host"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(255));
+    assert!(fixture.0.join("askpass-args").exists());
+}
+
+fn ssh_transport() -> String {
+    let mut review = sample_review();
+    review.truncate(review.len() - 4);
+    review.splice(1..1, ["--kind".into(), "ssh".into()]);
+    review.extend(["--origin".into(), "12:/bin/sh".into()]);
+    approve::encode_review(&review).unwrap()
+}
+
+#[test]
+fn ssh_adapter_shows_the_prompt_and_the_parent_executable() {
+    let fixture = Fixture::new();
+    let output = fixture
+        .command(env!("CARGO_BIN_EXE_approve-askpass"))
+        .env(approve::REVIEW_ENV, ssh_transport())
+        .arg("Enter passphrase for key '/k\x1b[0m':")
+        .output()
+        .unwrap();
+    // The stand-in askpass cancels; the adapter propagates its status.
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let args = fixture.args("askpass-args");
+    let tail = &args[args.len() - 4..];
+    // The adapter's parent here is this test process.
+    let parent = format!(
+        "{}:{}",
+        std::process::id(),
+        std::env::current_exe().unwrap().display()
+    );
+    assert_eq!(
+        tail,
+        [
+            "--prompt",
+            "Enter passphrase for key '/k\\u{1b}[0m':",
+            "--prompt-process",
+            parent.as_str()
+        ]
+    );
+}
+
+#[test]
+fn ssh_adapter_refuses_confirmation_notification_and_bad_prompt_counts() {
+    let fixture = Fixture::new();
+    for (hint, message) in [
+        ("confirm", "SSH_ASKPASS_PROMPT=confirm"),
+        ("none", "SSH_ASKPASS_PROMPT=none"),
+        ("other", "unsupported SSH_ASKPASS_PROMPT"),
+    ] {
+        let output = fixture
+            .command(env!("CARGO_BIN_EXE_approve-askpass"))
+            .env(approve::REVIEW_ENV, ssh_transport())
+            .env("SSH_ASKPASS_PROMPT", hint)
+            .arg("Allow use of key? ")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains(message));
+        assert!(!fixture.0.join("askpass-args").exists());
+    }
+    for prompts in [vec![], vec!["one", "two"]] {
+        assert_adapter_rejects(
+            &fixture,
+            OsStr::new(&ssh_transport()),
+            &prompts,
+            "expected one prompt argument",
+        );
+    }
+    assert_adapter_rejects(
+        &fixture,
+        OsStr::new(&ssh_transport()),
+        &[""],
+        "empty prompt",
+    );
+    // A sudo prompt is ignored, and sudo reviews never gain prompt fields.
+    let output = fixture
+        .command(env!("CARGO_BIN_EXE_approve-askpass"))
+        .env(approve::REVIEW_ENV, unchecked_transport(&sample_review()))
+        .env("SSH_ASKPASS_PROMPT", "confirm")
+        .arg("Password: ")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        fixture.args("askpass-args"),
+        sample_review()
+            .iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn ssh_mode_reports_a_missing_command_without_sudo() {
+    let fixture = Fixture::new();
+    let output = fixture
+        .command(env!("CARGO_BIN_EXE_approve"))
+        .args(["--ssh", "-d", "missing", "--", "no-such-ssh"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("could not execute \"no-such-ssh\""),
+        "{output:?}"
+    );
+    assert!(!fixture.0.join("sudo-args").exists());
 }

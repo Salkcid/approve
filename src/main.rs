@@ -1,5 +1,6 @@
 use approve::{
-    Facts, REVIEW_ENV, Request, USAGE, encode_review, find_askpass, review_arguments, sudo_command,
+    Facts, Mode, Request, USAGE, encode_review, find_askpass, launch_command, quote,
+    review_arguments,
 };
 use std::os::unix::process::CommandExt;
 
@@ -20,12 +21,11 @@ fn run() -> Result<(), String> {
     }
     let askpass = find_askpass()?;
     // Replacing the process preserves stdio, cwd, exit status, and signals.
-    let error = sudo_command(&request)
-        .env("SUDO_ASKPASS", helper)
-        .env("APPROVE_ASKPASS", askpass)
-        .env(REVIEW_ENV, review)
-        .exec();
-    Err(format!("could not execute sudo: {error}"))
+    let error = launch_command(&request, &helper, &askpass, &review).exec();
+    Err(match request.mode {
+        Mode::Sudo => format!("could not execute sudo: {error}"),
+        Mode::Ssh => format!("could not execute {}: {error}", quote(&request.command[0])),
+    })
 }
 
 fn main() {

@@ -1,18 +1,19 @@
 # approve
 
 A CLI wrapper for reviewing an agent's explanation and observed execution facts
-together with password entry in an askpass dialog. See [SPEC.md](SPEC.md) for the
+together with password or SSH key passphrase entry in an askpass dialog. See [SPEC.md](SPEC.md) for the
 v1 design.
 
 This is a Linux desktop tool for a local user whose sudo policy requires a
-password. It needs `sudo`, [askpass v0.1](https://github.com/Salkcid/askpass),
+password. It needs `sudo`, [askpass v0.1](https://github.com/Salkcid/askpass) (v0.2 for SSH mode),
 and a Wayland session. The approval dialog shows the submitted arguments and a snapshot of the calling process; it cannot
 verify the full behavior of a script or a mutable executable.
 
 The project-local `approve-askpass` adapter executes `askpass --review` with
 structured request fields. Only the sudo child receives `SUDO_ASKPASS`,
 `APPROVE_ASKPASS`, and a length-prefixed review in `APPROVE_REVIEW`; global sudo
-and SSH askpass settings are untouched. The adapter removes the review transport
+and SSH askpass settings are untouched. In SSH mode, the command itself receives
+`SSH_ASKPASS` and `SSH_ASKPASS_REQUIRE=force` instead of `SUDO_ASKPASS`. The adapter removes the review transport
 from the dialog's environment and replaces itself with askpass. Password output
 flows directly from askpass into sudo's pipe.
 
@@ -37,7 +38,32 @@ approve -d 'Show the current user' -- id
 ```
 
 The example requests sudo approval. Callers omit `sudo` and pass command
-arguments after `--`; an explicit shell is needed for shell syntax. See askpass’s
+arguments after `--`; an explicit shell is needed for shell syntax.
+
+### SSH mode
+
+```sh
+approve --ssh -d 'Push the release branch' -- git push origin main
+```
+
+`--ssh` runs the command directly as you, without sudo. When ssh, run by the
+command or by git, needs a key passphrase, it opens the same review dialog,
+titled “SSH authentication requested”. The dialog shows ssh's own prompt, which
+names the key, and the PID and executable of the process asking for it. This
+needs askpass v0.2 or later. If an ssh-agent already holds the key, ssh does not
+prompt and no dialog appears.
+
+ssh may prompt several times in one command, for several keys or retries; each
+prompt opens its own dialog. Yes/no confirmation and notification prompts
+(`SSH_ASKPASS_PROMPT=confirm` or `none`) are refused with an error, which ssh
+treats as “no”.
+
+Unlike sudo, ssh is an ordinary user process, so a fake `ssh` earlier on `PATH`
+could receive the passphrase. Always check the Prompted by path. Packagers can
+build with `APPROVE_SSH=/path/to/ssh` so that the adapter refuses any other
+parent executable. The path is fixed at compile time and read from `/proc`,
+never from the runtime environment. This does not stop a program that opens its
+own dialog instead of using approve's adapter. See askpass’s
 README for the optional Niri floating-window rule.
 
 ## Development
@@ -87,7 +113,9 @@ the request budget.
 The automated tests use stand-ins for sudo and askpass; they require no root
 access, GUI interaction, or passwords. They cover structured transport, exact
 budget boundaries, argument and stream preservation, exit status, malformed
-requests, executable lookup, and cancellation through the adapter. Real
+requests, executable lookup, and cancellation through the adapter, as well as
+SSH mode's launch environment, repeated prompts, prompt-hint refusal, and the
+parent-executable check against `/proc` snapshots. Real
 authentication and dialog layout require manual checks in a Wayland session,
 outside sandboxes that set `NoNewPrivs`.
 
@@ -114,6 +142,9 @@ sudo -v
 ./target/debug/approve -d 'Test literal values: <b>_reason_</b> %u' -- \
   printf '<%s>\n' 'two words' 'a"quote' 'line
 break' '%p%u%%' '<b>_literal_ & text</b>'
+# SSH mode without a terminal: expect the key prompt and the ssh path, then Cancel.
+setsid -w ./target/debug/approve --ssh -d 'Test GitHub auth' -- \
+  ssh -T git@github.com </dev/null
 ```
 
 These approval guarantees cover a normal user with password-requiring sudo.

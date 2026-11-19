@@ -7,20 +7,40 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-pub const USAGE: &str = "Usage: approve -d <description> -- <command> [arguments...]";
+pub const USAGE: &str = "Usage: approve [--ssh] -d <description> -- <command> [arguments...]";
 // askpass v0.1 counts the UTF-8 bytes of all option names and values.
 pub const MAX_REVIEW_BYTES: usize = 16 * 1024;
 pub const REVIEW_ENV: &str = "APPROVE_REVIEW";
+// The ssh executable the Nix package expects to request passphrases. It is
+// fixed at build time because the wrapped command controls the runtime
+// environment that ssh and the adapter inherit.
+pub const EXPECTED_SSH: Option<&str> = option_env!("APPROVE_SSH");
+
+/// How the command obtains authorization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Run the command as root through `sudo -A`.
+    Sudo,
+    /// Run the command directly; ssh asks for key passphrases through the adapter.
+    Ssh,
+}
 
 #[derive(Debug)]
 pub struct Request {
+    pub mode: Mode,
     pub description: OsString,
     pub command: Vec<OsString>,
 }
 
 impl Request {
     pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Self, String> {
-        let mut args = args.into_iter();
+        let mut args = args.into_iter().peekable();
+        let mode = if args.peek().map(OsString::as_os_str) == Some(OsStr::new("--ssh")) {
+            args.next();
+            Mode::Ssh
+        } else {
+            Mode::Sudo
+        };
         if args.next().as_deref() != Some(OsStr::new("-d")) {
             return Err("a description must follow -d".into());
         }
@@ -38,6 +58,7 @@ impl Request {
             return Err("missing command after --".into());
         }
         Ok(Self {
+            mode,
             description,
             command,
         })
@@ -79,6 +100,7 @@ fn status_number(status: &str, key: &str) -> Option<u32> {
     })
 }
 
+#[derive(Debug)]
 pub struct Origin {
     pub pid: u32,
     pub executable: OsString,
@@ -154,11 +176,13 @@ fn display_value(value: &OsStr) -> String {
 }
 
 pub fn review_arguments(request: &Request, facts: &Facts) -> Result<Vec<String>, String> {
-    let mut args = vec![
-        "--review".into(),
-        "--reason".into(),
-        display_value(&request.description),
-    ];
+    let mut args = vec!["--review".into()];
+    // askpass v0.2 defaults to sudo; naming only ssh keeps sudo requests
+    // compatible with askpass v0.1.
+    if request.mode == Mode::Ssh {
+        args.extend(["--kind".into(), "ssh".into()]);
+    }
+    args.extend(["--reason".into(), display_value(&request.description)]);
     for argument in &request.command {
         args.extend(["--command-arg".into(), display_value(argument)]);
     }
@@ -173,9 +197,11 @@ pub fn review_arguments(request: &Request, facts: &Facts) -> Result<Vec<String>,
             .unwrap_or_else(|| "unavailable".into()),
         "--requesting-uid".into(),
         facts.uid.to_string(),
-        "--run-as-user".into(),
-        "root".into(),
     ]);
+    // An ssh-mode command keeps the caller's identity, so there is no target user.
+    if request.mode == Mode::Sudo {
+        args.extend(["--run-as-user".into(), "root".into()]);
+    }
     for origin in &facts.origin {
         args.extend([
             "--origin".into(),
@@ -218,6 +244,14 @@ pub fn decode_review(encoded: &str) -> Result<Vec<String>, String> {
     Ok(args)
 }
 
+fn valid_process(value: &str) -> bool {
+    value.split_once(':').is_some_and(|(pid, executable)| {
+        pid.bytes().all(|b| b.is_ascii_digit())
+            && pid.parse::<u32>().is_ok_and(|n| n != 0)
+            && !executable.is_empty()
+    })
+}
+
 fn validate_review(args: &[String]) -> Result<(), String> {
     if args.iter().map(String::len).sum::<usize>() > MAX_REVIEW_BYTES {
         return Err("review exceeds askpass's 16 KiB budget; refusing to truncate".into());
@@ -227,6 +261,7 @@ fn validate_review(args: &[String]) -> Result<(), String> {
     }
     let mut seen = HashSet::new();
     let mut command_count = 0;
+    let mut kind = "sudo";
     for pair in args[1..].chunks_exact(2) {
         let option = pair[0].as_str();
         let value = &pair[1];
@@ -238,11 +273,7 @@ fn validate_review(args: &[String]) -> Result<(), String> {
                 command_count += 1;
             }
             "--origin" => {
-                let (pid, executable) = value.split_once(':').ok_or("invalid origin")?;
-                if pid.parse::<u32>().ok().filter(|&n| n != 0).is_none()
-                    || !pid.bytes().all(|b| b.is_ascii_digit())
-                    || executable.is_empty()
-                {
+                if !valid_process(value) {
                     return Err("invalid origin".into());
                 }
             }
@@ -250,7 +281,10 @@ fn validate_review(args: &[String]) -> Result<(), String> {
             | "--working-directory"
             | "--requesting-user"
             | "--requesting-uid"
-            | "--run-as-user" => {
+            | "--run-as-user"
+            | "--kind"
+            | "--prompt"
+            | "--prompt-process" => {
                 if !seen.insert(option)
                     || value.is_empty()
                     || (option == "--reason" && value.trim().is_empty())
@@ -265,14 +299,118 @@ fn validate_review(args: &[String]) -> Result<(), String> {
                 if option == "--run-as-user" && value != "root" {
                     return Err("run-as user must be root".into());
                 }
+                if option == "--kind" {
+                    kind = match value.as_str() {
+                        "sudo" => "sudo",
+                        "ssh" => "ssh",
+                        _ => return Err("kind must be sudo or ssh".into()),
+                    };
+                }
+                if option == "--prompt-process" && !valid_process(value) {
+                    return Err("invalid prompt process".into());
+                }
             }
             _ => return Err(format!("unsupported review option: {option}")),
         }
     }
-    if seen.len() != 5 || command_count == 0 {
+    let required = [
+        "--reason",
+        "--working-directory",
+        "--requesting-user",
+        "--requesting-uid",
+    ];
+    if command_count == 0 || required.iter().any(|option| !seen.contains(option)) {
         return Err("incomplete review".into());
     }
-    Ok(())
+    let prompt = seen.contains("--prompt");
+    if prompt != seen.contains("--prompt-process") {
+        return Err("prompt and prompt process must be supplied together".into());
+    }
+    match kind {
+        "ssh" if seen.contains("--run-as-user") => {
+            Err("run-as user does not apply to ssh requests".into())
+        }
+        "sudo" if prompt => Err("prompt fields require an ssh request".into()),
+        "sudo" if !seen.contains("--run-as-user") => Err("incomplete review".into()),
+        _ => Ok(()),
+    }
+}
+
+pub fn is_ssh_review(args: &[String]) -> bool {
+    args.get(1..)
+        .unwrap_or_default()
+        .chunks_exact(2)
+        .any(|pair| pair == ["--kind", "ssh"])
+}
+
+/// Add the per-call prompt facts to an ssh review. ssh may run the adapter
+/// several times in one session, so each call builds its own copy.
+pub fn ssh_prompt_review(
+    mut args: Vec<String>,
+    prompt: &OsStr,
+    process: &Origin,
+) -> Result<Vec<String>, String> {
+    if !is_ssh_review(&args) {
+        return Err("prompt fields require an ssh request".into());
+    }
+    if prompt.is_empty() {
+        return Err("ssh supplied an empty prompt".into());
+    }
+    args.extend([
+        "--prompt".into(),
+        display_value(prompt),
+        "--prompt-process".into(),
+        format!("{}:{}", process.pid, display_value(&process.executable)),
+    ]);
+    validate_review(&args)?;
+    Ok(args)
+}
+
+/// Interpret ssh's `SSH_ASKPASS_PROMPT` hint. askpass only collects a secret,
+/// so confirmation and notification prompts are refused instead of answered.
+pub fn check_ssh_prompt_hint(hint: Option<&OsStr>) -> Result<(), String> {
+    match hint.map(OsStr::as_bytes) {
+        None | Some(b"") => Ok(()),
+        Some(b"confirm") => Err(
+            "ssh requested a yes/no confirmation (SSH_ASKPASS_PROMPT=confirm); approve only answers passphrase prompts, so the request is refused".into(),
+        ),
+        Some(b"none") => Err(
+            "ssh requested a notification without input (SSH_ASKPASS_PROMPT=none); approve only answers passphrase prompts, so the request is refused".into(),
+        ),
+        Some(_) => Err(format!(
+            "unsupported SSH_ASKPASS_PROMPT value {}",
+            quote(hint.unwrap())
+        )),
+    }
+}
+
+/// Identify the process that will read the adapter's output. In ssh mode the
+/// passphrase goes to this parent, so its executable is read from `/proc` (not
+/// from the environment) and, when `expected` is fixed, must match it exactly.
+pub fn prompt_process(proc: &Path, expected: Option<&Path>) -> Result<Origin, String> {
+    let status = fs::read_to_string(proc.join("self/status"))
+        .map_err(|e| format!("cannot read process identity: {e}"))?;
+    let pid = status_number(&status, "PPid:")
+        .filter(|&pid| pid != 0)
+        .ok_or("cannot identify the process requesting the passphrase")?;
+    let executable = fs::read_link(proc.join(format!("{pid}/exe"))).map_err(|e| {
+        format!("cannot read the executable of prompting process {pid}; refusing: {e}")
+    })?;
+    if let Some(expected) = expected {
+        // Canonicalize the build-time path so a profile symlink names its target.
+        let expected = fs::canonicalize(expected).unwrap_or_else(|_| expected.to_owned());
+        if executable != expected {
+            return Err(format!(
+                "refusing passphrase prompt from {} (PID {pid}); expected {}",
+                quote(executable.as_os_str()),
+                quote(expected.as_os_str())
+            ));
+        }
+    }
+    Ok(Origin {
+        pid,
+        executable: executable.into_os_string(),
+    })
 }
 
 pub fn find_askpass() -> Result<PathBuf, String> {
@@ -298,11 +436,31 @@ pub fn find_askpass() -> Result<PathBuf, String> {
         .ok_or_else(|| "askpass is not on PATH; install askpass v0.1 or set APPROVE_ASKPASS to its absolute path".into())
 }
 
-pub fn sudo_command(request: &Request) -> Command {
-    let mut command = Command::new("sudo");
+/// Build the command that replaces approve. Only this child receives the
+/// askpass selection and the review transport.
+pub fn launch_command(request: &Request, helper: &Path, askpass: &Path, review: &str) -> Command {
+    let mut command = match request.mode {
+        Mode::Sudo => {
+            let mut command = Command::new("sudo");
+            command
+                .args(["-k", "-A", "-p", "Password: ", "--"])
+                .args(&request.command)
+                .env("SUDO_ASKPASS", helper);
+            command
+        }
+        Mode::Ssh => {
+            let mut command = Command::new(&request.command[0]);
+            command
+                .args(&request.command[1..])
+                .env("SSH_ASKPASS", helper)
+                // Use the dialog with or without a terminal or display variable.
+                .env("SSH_ASKPASS_REQUIRE", "force");
+            command
+        }
+    };
     command
-        .args(["-k", "-A", "-p", "Password: ", "--"])
-        .args(&request.command);
+        .env("APPROVE_ASKPASS", askpass)
+        .env(REVIEW_ENV, review);
     command
 }
 
@@ -420,5 +578,302 @@ mod tests {
                 .unwrap()
                 .contains("cannot read process identity")
         );
+    }
+
+    fn os(values: &[&str]) -> Vec<OsString> {
+        values.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn parses_ssh_mode_only_as_the_leading_option() {
+        let sudo = Request::parse(os(&["-d", "why", "--", "id"])).unwrap();
+        assert_eq!(sudo.mode, Mode::Sudo);
+        let ssh = Request::parse(os(&["--ssh", "-d", "why", "--", "git", "push"])).unwrap();
+        assert_eq!(ssh.mode, Mode::Ssh);
+        assert_eq!(ssh.description, "why");
+        assert_eq!(ssh.command, os(&["git", "push"]));
+        // After -- it is part of the command, not a mode switch.
+        let literal = Request::parse(os(&["-d", "why", "--", "--ssh"])).unwrap();
+        assert_eq!(
+            (literal.mode, literal.command),
+            (Mode::Sudo, os(&["--ssh"]))
+        );
+        for args in [
+            os(&["--ssh"]),
+            os(&["--ssh", "--ssh", "-d", "why", "--", "id"]),
+            os(&["-d", "why", "--ssh", "--", "id"]),
+            os(&["--ssh", "-d", "why", "--"]),
+            os(&["--ssh", "-d", " ", "--", "id"]),
+        ] {
+            assert!(Request::parse(args.clone()).is_err(), "{args:?}");
+        }
+    }
+
+    fn envs(command: &Command) -> Vec<(String, Option<String>)> {
+        let mut envs: Vec<_> = command
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        envs.sort();
+        envs
+    }
+
+    #[test]
+    fn launch_environment_is_scoped_to_the_selected_mode() {
+        let helper = Path::new("/libexec/approve-askpass");
+        let askpass = Path::new("/bin/askpass");
+        let mut request = Request::parse(os(&["-d", "why", "--", "git", "", "-v"])).unwrap();
+        let sudo = launch_command(&request, helper, askpass, "8:--review");
+        assert_eq!(sudo.get_program(), "sudo");
+        let args: Vec<_> = sudo.get_args().collect();
+        assert_eq!(
+            args,
+            ["-k", "-A", "-p", "Password: ", "--", "git", "", "-v"]
+        );
+        let expected = |askpass_var: &str| {
+            let mut expected = vec![
+                ("APPROVE_ASKPASS".into(), Some("/bin/askpass".into())),
+                (REVIEW_ENV.into(), Some("8:--review".into())),
+                (askpass_var.into(), Some("/libexec/approve-askpass".into())),
+            ];
+            if askpass_var == "SSH_ASKPASS" {
+                expected.push(("SSH_ASKPASS_REQUIRE".into(), Some("force".into())));
+            }
+            expected.sort();
+            expected
+        };
+        assert_eq!(envs(&sudo), expected("SUDO_ASKPASS"));
+
+        request.mode = Mode::Ssh;
+        let ssh = launch_command(&request, helper, askpass, "8:--review");
+        // The command runs directly as the caller; sudo is not involved.
+        assert_eq!(ssh.get_program(), "git");
+        let args: Vec<_> = ssh.get_args().collect();
+        assert_eq!(args, ["", "-v"]);
+        assert_eq!(envs(&ssh), expected("SSH_ASKPASS"));
+    }
+
+    fn sample_facts() -> Facts {
+        Facts {
+            cwd: "/repo".into(),
+            uid: 1000,
+            username: Some("alice".into()),
+            origin: vec![Origin {
+                pid: 12,
+                executable: "/bin/sh".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn ssh_review_names_its_kind_and_omits_the_target_user() {
+        let request = Request::parse(os(&["--ssh", "-d", "Push", "--", "git", "push"])).unwrap();
+        let review = review_arguments(&request, &sample_facts()).unwrap();
+        assert_eq!(
+            review,
+            [
+                "--review",
+                "--kind",
+                "ssh",
+                "--reason",
+                "Push",
+                "--command-arg",
+                "git",
+                "--command-arg",
+                "push",
+                "--working-directory",
+                "/repo",
+                "--requesting-user",
+                "alice",
+                "--requesting-uid",
+                "1000",
+                "--origin",
+                "12:/bin/sh",
+            ]
+        );
+        assert!(is_ssh_review(&review));
+        let sudo = Request::parse(os(&["-d", "Push", "--", "id"])).unwrap();
+        let sudo = review_arguments(&sudo, &sample_facts()).unwrap();
+        assert!(!is_ssh_review(&sudo));
+        assert!(!sudo.contains(&"--kind".into()));
+        assert_eq!(
+            &sudo[sudo.len() - 4..sudo.len() - 2],
+            ["--run-as-user", "root"]
+        );
+    }
+
+    #[test]
+    fn each_prompt_call_adds_its_own_escaped_prompt_and_process() {
+        let request = Request::parse(os(&["--ssh", "-d", "Push", "--", "git", "push"])).unwrap();
+        let review = review_arguments(&request, &sample_facts()).unwrap();
+        let process = Origin {
+            pid: 77,
+            executable: "/nix/store/x-openssh/bin/ssh".into(),
+        };
+        let first = ssh_prompt_review(
+            review.clone(),
+            OsStr::new("Enter passphrase for key '/home/alice/.ssh/id_rsa': "),
+            &process,
+        )
+        .unwrap();
+        assert_eq!(
+            &first[review.len()..],
+            [
+                "--prompt",
+                "Enter passphrase for key '/home/alice/.ssh/id_rsa': ",
+                "--prompt-process",
+                "77:/nix/store/x-openssh/bin/ssh",
+            ]
+        );
+        // A second call (another key, or a retry) starts from the same transport.
+        let prompt = OsStr::from_bytes(b"Key '\xff\n\x1b[31m\"\\':");
+        let second = ssh_prompt_review(review.clone(), prompt, &process).unwrap();
+        assert_eq!(second[review.len() + 1], r#"Key '\xff\n\u{1b}[31m\"\\':"#);
+        assert_eq!(
+            decode_review(&encode_review(&second).unwrap()).unwrap(),
+            second
+        );
+        // A transport cannot pre-seed prompt fields for the adapter to display.
+        let seeded = ssh_prompt_review(first, OsStr::new("again"), &process);
+        assert!(seeded.unwrap_err().contains("duplicate"));
+        assert!(
+            ssh_prompt_review(review.clone(), OsStr::new(""), &process)
+                .unwrap_err()
+                .contains("empty prompt")
+        );
+        let sudo = Request::parse(os(&["-d", "x", "--", "id"])).unwrap();
+        let sudo = review_arguments(&sudo, &sample_facts()).unwrap();
+        assert!(
+            ssh_prompt_review(sudo, OsStr::new("Password: "), &process)
+                .unwrap_err()
+                .contains("require an ssh request")
+        );
+        let mut full = review;
+        let room = MAX_REVIEW_BYTES - full.iter().map(String::len).sum::<usize>();
+        full[4].push_str(&"x".repeat(room));
+        assert!(
+            ssh_prompt_review(full, OsStr::new("Passphrase: "), &process)
+                .unwrap_err()
+                .contains("refusing to truncate")
+        );
+    }
+
+    #[test]
+    fn review_kind_rules_are_validated() {
+        let request = Request::parse(os(&["--ssh", "-d", "Push", "--", "git"])).unwrap();
+        let ssh = review_arguments(&request, &sample_facts()).unwrap();
+        let with = |base: &[String], extra: &[&str]| {
+            let mut args = base.to_vec();
+            args.extend(extra.iter().map(|s| s.to_string()));
+            encode_review(&args)
+        };
+        assert!(
+            with(&ssh, &["--run-as-user", "root"])
+                .unwrap_err()
+                .contains("does not apply")
+        );
+        assert!(
+            with(&ssh, &["--kind", "ssh"])
+                .unwrap_err()
+                .contains("duplicate")
+        );
+        assert!(
+            with(&ssh, &["--prompt", "p"])
+                .unwrap_err()
+                .contains("together")
+        );
+        assert!(
+            with(&ssh, &["--prompt-process", "1:/ssh"])
+                .unwrap_err()
+                .contains("together")
+        );
+        for process in ["0:/ssh", "1:", "x:/ssh", "+1:/ssh"] {
+            let error = with(&ssh, &["--prompt", "p", "--prompt-process", process]).unwrap_err();
+            assert_eq!(error, "invalid prompt process", "{process}");
+        }
+        let mut other = ssh.clone();
+        other[2] = "gpg".into();
+        assert_eq!(
+            encode_review(&other).unwrap_err(),
+            "kind must be sudo or ssh"
+        );
+        let sudo = Request::parse(os(&["-d", "x", "--", "id"])).unwrap();
+        let sudo = review_arguments(&sudo, &sample_facts()).unwrap();
+        assert!(with(&sudo, &["--kind", "sudo"]).is_ok());
+        let prompted = with(&sudo, &["--prompt", "p", "--prompt-process", "1:/ssh"]);
+        assert!(prompted.unwrap_err().contains("require an ssh request"));
+        let mut explicit_sudo = ssh;
+        explicit_sudo[2] = "sudo".into();
+        assert_eq!(
+            encode_review(&explicit_sudo).unwrap_err(),
+            "incomplete review"
+        );
+    }
+
+    #[test]
+    fn prompt_hint_allows_only_passphrase_prompts() {
+        assert!(check_ssh_prompt_hint(None).is_ok());
+        assert!(check_ssh_prompt_hint(Some(OsStr::new(""))).is_ok());
+        for (hint, message) in [
+            ("confirm", "SSH_ASKPASS_PROMPT=confirm"),
+            ("none", "SSH_ASKPASS_PROMPT=none"),
+            (
+                "other\n",
+                "unsupported SSH_ASKPASS_PROMPT value \"other\\n\"",
+            ),
+        ] {
+            let error = check_ssh_prompt_hint(Some(OsStr::new(hint))).unwrap_err();
+            assert!(error.contains(message), "{error}");
+        }
+    }
+
+    #[test]
+    fn prompt_process_reads_the_parent_exe_and_enforces_the_build_path() {
+        let snapshot = Snapshot::new();
+        snapshot.process(10, "1", Some("/nix/store/x-openssh/bin/ssh"));
+        let process = prompt_process(&snapshot.0, None).unwrap();
+        assert_eq!(process.pid, 10);
+        assert_eq!(process.executable, "/nix/store/x-openssh/bin/ssh");
+        let expected = Path::new("/nix/store/x-openssh/bin/ssh");
+        assert_eq!(prompt_process(&snapshot.0, Some(expected)).unwrap().pid, 10);
+        // A build-time symlink is compared by its target.
+        let link = snapshot.0.join("ssh-link");
+        let target = snapshot.0.join("real-ssh");
+        fs::write(&target, "").unwrap();
+        symlink(&target, &link).unwrap();
+        let other = Snapshot::new();
+        other.process(10, "1", Some(target.to_str().unwrap()));
+        assert_eq!(
+            prompt_process(&other.0, Some(&link)).unwrap().executable,
+            target
+        );
+
+        let error = prompt_process(&snapshot.0, Some(Path::new("/usr/bin/ssh"))).unwrap_err();
+        assert!(error.contains("refusing passphrase prompt from"), "{error}");
+        assert!(error.contains("PID 10"), "{error}");
+        for fake in ["/tmp/bin/ssh", "/nix/store/x-openssh/bin/ssh (deleted)"] {
+            let snapshot = Snapshot::new();
+            snapshot.process(10, "1", Some(fake));
+            assert!(
+                prompt_process(&snapshot.0, Some(expected)).is_err(),
+                "{fake}"
+            );
+            assert_eq!(prompt_process(&snapshot.0, None).unwrap().executable, fake);
+        }
+        // Without a readable parent executable, nothing is shown or sent.
+        let snapshot = Snapshot::new();
+        snapshot.process(10, "1", None);
+        let error = prompt_process(&snapshot.0, None).unwrap_err();
+        assert!(error.contains("cannot read the executable"), "{error}");
+        for status in ["Uid: 1000\nPPid: 0\n", "Uid: 1000\n"] {
+            fs::write(snapshot.0.join("self/status"), status).unwrap();
+            let error = prompt_process(&snapshot.0, None).unwrap_err();
+            assert!(error.contains("cannot identify"), "{error}");
+        }
     }
 }

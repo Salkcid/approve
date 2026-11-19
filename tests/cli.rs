@@ -517,6 +517,19 @@ fn budget_matches_askpass_option_and_value_bytes() {
 }
 
 #[test]
+fn decode_rejects_transport_over_size_limit_before_parsing() {
+    let limit = approve::MAX_REVIEW_BYTES * 3;
+    assert_eq!(
+        approve::decode_review(&"x".repeat(limit)).unwrap_err(),
+        "invalid review transport"
+    );
+    assert_eq!(
+        approve::decode_review(&"x".repeat(limit + 1)).unwrap_err(),
+        "review transport is too large"
+    );
+}
+
+#[test]
 fn executable_lookup_supports_path_and_rejects_invalid_override() {
     let fixture = Fixture::new();
     let run = |override_path: Option<&Path>| {

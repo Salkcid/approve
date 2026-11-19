@@ -19,7 +19,9 @@
             overlays = [ rust-overlay.overlays.default ];
           };
         in
-        f pkgs (pkgs.rust-bin.stable.latest.default.override {
+        # Keep in step with rust-version in Cargo.toml. To upgrade, bump both
+        # (and `nix flake update rust-overlay` if it lacks the new release).
+        f pkgs (pkgs.rust-bin.stable."1.100.0".default.override {
           extensions = [ "rust-src" "rust-analyzer" ];
         }));
     in

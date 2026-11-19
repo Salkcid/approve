@@ -2,6 +2,7 @@
 name = "approve"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.100"
 description = "Review caller explanations and observed facts in a sudo or SSH askpass prompt"
 license = "MIT"
 repository = "https://github.com/Salkcid/approve"

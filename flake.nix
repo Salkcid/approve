@@ -27,10 +27,15 @@
       devShells = forSystems (pkgs: rust: {
         default = pkgs.mkShell {
           packages = [ rust pkgs.cargo-mutants ];
+          # Use the committed hooks; .githooks/pre-commit runs lint and mutants.
+          shellHook = ''
+            git config core.hooksPath .githooks
+          '';
         };
       });
 
-      # `nix flake check` enforces formatting and the [lints] table in Cargo.toml.
+      # `nix flake check` enforces formatting, the [lints] table in Cargo.toml,
+      # and that every viable mutant is caught by the test suite.
       # The crate has no dependencies, so cargo runs offline without vendoring.
       checks = forSystems (pkgs: rust: {
         lint = pkgs.runCommand "approve-lint" { nativeBuildInputs = [ rust ]; } ''
@@ -38,6 +43,14 @@
           export CARGO_HOME=$TMPDIR/cargo
           cargo fmt --check
           cargo clippy --offline --all-targets --all-features -- -D warnings
+          touch $out
+        '';
+        mutants = pkgs.runCommand "approve-mutants" {
+          nativeBuildInputs = [ rust pkgs.cargo-mutants ];
+        } ''
+          cp -r ${./.} src && chmod -R u+w src && cd src
+          export CARGO_HOME=$TMPDIR/cargo
+          cargo mutants --no-shuffle --jobs 4
           touch $out
         '';
       });

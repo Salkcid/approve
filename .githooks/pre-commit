@@ -1,0 +1,18 @@
+#!/bin/sh
+# Lint the tree and mutation-test the staged Rust changes.
+# Bypass with `git commit --no-verify`; `nix flake check` runs the full suite.
+set -eu
+
+if [ -z "${IN_NIX_SHELL:-}" ]; then
+    exec nix develop --command "$0" "$@"
+fi
+
+cargo fmt --check
+cargo clippy --quiet --all-targets --all-features -- -D warnings
+
+diff=$(mktemp)
+trap 'rm -f "$diff"' EXIT
+git diff --cached --no-ext-diff -- '*.rs' > "$diff"
+if [ -s "$diff" ]; then
+    cargo mutants --in-diff "$diff" --jobs 4
+fi

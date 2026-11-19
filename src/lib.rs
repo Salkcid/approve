@@ -270,17 +270,17 @@ fn validate_review(args: &[String]) -> Result<(), String> {
         _ => return Err("invalid review arguments".into()),
     };
     let mut seen = HashSet::new();
-    let mut command_count = 0;
+    let mut has_command = false;
     let mut kind = "sudo";
     let (pairs, _) = fields.as_chunks::<2>();
     for [option, value] in pairs {
         let option = option.as_str();
         match option {
             "--command-arg" => {
-                if command_count == 0 && value.is_empty() {
+                if !has_command && value.is_empty() {
                     return Err("empty executable".into());
                 }
-                command_count += 1;
+                has_command = true;
             }
             "--origin" => {
                 if !valid_process(value) {
@@ -329,7 +329,7 @@ fn validate_review(args: &[String]) -> Result<(), String> {
         "--requesting-user",
         "--requesting-uid",
     ];
-    if command_count == 0 || required.iter().any(|option| !seen.contains(option)) {
+    if !has_command || required.iter().any(|option| !seen.contains(option)) {
         return Err("incomplete review".into());
     }
     let prompt = seen.contains("--prompt");

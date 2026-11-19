@@ -26,7 +26,7 @@
     {
       devShells = forSystems (pkgs: rust: {
         default = pkgs.mkShell {
-          packages = [ rust ];
+          packages = [ rust pkgs.cargo-mutants ];
         };
       });
 

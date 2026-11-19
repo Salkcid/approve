@@ -262,9 +262,9 @@ fn validate_review(args: &[String]) -> Result<(), String> {
     let mut seen = HashSet::new();
     let mut command_count = 0;
     let mut kind = "sudo";
-    for pair in args[1..].chunks_exact(2) {
-        let option = pair[0].as_str();
-        let value = &pair[1];
+    let (pairs, _) = args[1..].as_chunks::<2>();
+    for [option, value] in pairs {
+        let option = option.as_str();
         match option {
             "--command-arg" => {
                 if command_count == 0 && value.is_empty() {
@@ -339,8 +339,10 @@ fn validate_review(args: &[String]) -> Result<(), String> {
 pub fn is_ssh_review(args: &[String]) -> bool {
     args.get(1..)
         .unwrap_or_default()
-        .chunks_exact(2)
-        .any(|pair| pair == ["--kind", "ssh"])
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .any(|pair| pair == &["--kind", "ssh"])
 }
 
 /// Add the per-call prompt facts to an ssh review. ssh may run the adapter

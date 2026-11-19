@@ -240,9 +240,11 @@ fn preserves_execution_arguments_cwd_streams_and_status() {
     assert_eq!(sudo[4], "--");
     assert_eq!(sudo[5], "/bin/sh");
     let displayed_command: Vec<_> = review[1..]
-        .chunks_exact(2)
-        .filter(|pair| pair[0] == "--command-arg")
-        .map(|pair| pair[1].clone())
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .filter(|[option, _]| option == "--command-arg")
+        .map(|[_, value]| value.clone())
         .collect();
     let expected_command: Vec<_> = sudo[5..]
         .iter()

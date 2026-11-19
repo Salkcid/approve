@@ -288,6 +288,24 @@ fn sudo_failure_is_returned_without_running_the_target() {
 }
 
 #[test]
+fn help_prints_usage_without_invoking_sudo() {
+    let fixture = Fixture::new();
+    for flag in ["--help", "-h"] {
+        let output = fixture
+            .command(env!("CARGO_BIN_EXE_approve"))
+            .arg(flag)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("{}\n", approve::USAGE)
+        );
+        assert!(!fixture.0.join("sudo-args").exists());
+    }
+}
+
+#[test]
 fn invalid_and_oversized_requests_never_invoke_sudo() {
     let fixture = Fixture::new();
     for args in [

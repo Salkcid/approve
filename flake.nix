@@ -35,7 +35,8 @@
       });
 
       # `nix flake check` enforces formatting, the [lints] table in Cargo.toml,
-      # and that every viable mutant is caught by the test suite.
+      # that every viable mutant is caught by the test suite, and that clippy
+      # and the tests also pass for a build with APPROVE_SSH set.
       # The crate has no dependencies, so cargo runs offline without vendoring.
       checks = forSystems (pkgs: rust: {
         lint = pkgs.runCommand "approve-lint" { nativeBuildInputs = [ rust ]; } ''
@@ -51,6 +52,18 @@
           cp -r ${./.} src && chmod -R u+w src && cd src
           export CARGO_HOME=$TMPDIR/cargo
           cargo mutants --no-shuffle --jobs 4
+          touch $out
+        '';
+        # option_env!("APPROVE_SSH") makes this a different build: it enables
+        # the parent-executable check, which lint and mutants never compile.
+        ssh = pkgs.runCommand "approve-ssh" {
+          nativeBuildInputs = [ rust pkgs.openssh ];
+          APPROVE_SSH = "${pkgs.openssh}/bin/ssh";
+        } ''
+          cp -r ${./.} src && chmod -R u+w src && cd src
+          export CARGO_HOME=$TMPDIR/cargo
+          cargo clippy --offline --all-targets --all-features -- -D warnings
+          cargo test --offline
           touch $out
         '';
       });

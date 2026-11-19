@@ -118,7 +118,8 @@ SSH mode's launch environment, repeated prompts, prompt-hint refusal, and the
 parent-executable check against `/proc` snapshots. The suite passes with or
 without `APPROVE_SSH`; when it is set, tests that need an accepted parent have
 that ssh launch the adapter through `ssh -G` and `Match exec`, which makes no
-connection, and one test checks that other parents are refused. Real
+connection, and one test checks that other parents are refused. `nix flake
+check` runs clippy and the suite on both builds. Real
 authentication and dialog layout require manual checks in a Wayland session,
 outside sandboxes that set `NoNewPrivs`.
 

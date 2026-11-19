@@ -9,7 +9,7 @@
     };
   };
 
-  outputs = { nixpkgs, rust-overlay, ... }:
+  outputs = { self, nixpkgs, rust-overlay, ... }:
     let
       systems = [ "x86_64-linux" "aarch64-linux" ];
       forSystems = f: nixpkgs.lib.genAttrs systems (system:
@@ -24,6 +24,16 @@
         }));
     in
     {
+      # Built with the same toolchain as the dev shell and the checks, so the
+      # system gets exactly what was tested. Consumers should not make this
+      # input follow their nixpkgs: that swaps in their (possibly older) rustc.
+      # Override `expectedSsh` to pin SSH mode to a specific ssh binary.
+      packages = forSystems (pkgs: rust: {
+        default = pkgs.callPackage ./package.nix {
+          rustPlatform = pkgs.makeRustPlatform { cargo = rust; rustc = rust; };
+        };
+      });
+
       devShells = forSystems (pkgs: rust: {
         default = pkgs.mkShell {
           packages = [ rust pkgs.cargo-mutants pkgs.openssh ];
@@ -40,6 +50,8 @@
       # and the tests also pass for a build with APPROVE_SSH set.
       # The crate has no dependencies, so cargo runs offline without vendoring.
       checks = forSystems (pkgs: rust: {
+        # The derivation consumers install, including its test run.
+        package = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
         lint = pkgs.runCommand "approve-lint" { nativeBuildInputs = [ rust ]; } ''
           cp -r ${./.} src && chmod -R u+w src && cd src
           export CARGO_HOME=$TMPDIR/cargo

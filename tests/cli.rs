@@ -36,7 +36,51 @@ impl Fixture {
                 "shift 5\nexec \"$@\"\n"
             ),
         );
+        // `prompt <text>` asks $SSH_ASKPASS for one passphrase from a process
+        // this build accepts as ssh and prints the reply, as ssh would read it.
+        match approve::EXPECTED_SSH {
+            None => fixture.script("prompt", "exec \"$SSH_ASKPASS\" \"$1\"\n"),
+            Some(ssh) => {
+                let out = sh_quote(&fixture.0.join("prompt-out").to_string_lossy());
+                let config = fixture.ssh_launcher(
+                    "prompt-launch",
+                    &format!("exec \"$SSH_ASKPASS\" \"$PROMPT_TEXT\" > {out}\n"),
+                );
+                fixture.script(
+                    "prompt",
+                    &format!(
+                        concat!(
+                            "case $(PROMPT_TEXT=$1 {} -G -F {} approve-test 2>/dev/null) in\n",
+                            "  *'hostname accepted'*) ;;\n  *) exit 1 ;;\nesac\n",
+                            "IFS= read -r reply < {out}\nprintf '%s\\n' \"$reply\"\n"
+                        ),
+                        sh_quote(ssh),
+                        sh_quote(&config.to_string_lossy()),
+                        out = out,
+                    ),
+                );
+            }
+        }
         fixture
+    }
+
+    /// Write the script `name` and an ssh config whose `Match exec` runs it.
+    /// `ssh -G` evaluates that while resolving configuration, without
+    /// connecting, and the script replaces the shell, so the process it
+    /// becomes is a direct child of ssh. Success shows as `hostname accepted`.
+    fn ssh_launcher(&self, name: &str, body: &str) -> PathBuf {
+        self.script(name, body);
+        let config = self.0.join(format!("{name}.ssh-config"));
+        let launcher = self.0.join(name);
+        fs::write(
+            &config,
+            format!(
+                "Match exec \"exec {}\"\n  Hostname accepted\n",
+                launcher.display()
+            ),
+        )
+        .unwrap();
+        config
     }
 
     fn script(&self, name: &str, body: &str) {
@@ -67,6 +111,85 @@ impl Fixture {
             .split(|&b| b == 0)
             .map(|s| OsString::from_vec(s.to_vec()))
             .collect()
+    }
+}
+
+fn sh_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+struct AdapterRun {
+    /// The adapter's exit code, when it is observable.
+    code: Option<i32>,
+    success: bool,
+    stdout: Vec<u8>,
+    stderr: String,
+    /// The `--prompt-process` value the adapter should report.
+    parent: String,
+}
+
+/// Run the adapter as the child of a parent this build accepts. Without
+/// APPROVE_SSH any parent is accepted, so this test process runs it. With it,
+/// only the build-time ssh is, so that ssh launches the adapter (see
+/// `Fixture::ssh_launcher`); ssh then reveals only success or failure.
+fn run_adapter(fixture: &Fixture, transport: &str, prompts: &[&str]) -> AdapterRun {
+    let adapter = env!("CARGO_BIN_EXE_approve-askpass");
+    let Some(ssh) = approve::EXPECTED_SSH else {
+        let output = fixture
+            .command(adapter)
+            .env(approve::REVIEW_ENV, transport)
+            .args(prompts)
+            .output()
+            .unwrap();
+        return AdapterRun {
+            code: output.status.code(),
+            success: output.status.success(),
+            stdout: output.stdout,
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            parent: format!(
+                "{}:{}",
+                std::process::id(),
+                std::env::current_exe().unwrap().display()
+            ),
+        };
+    };
+    let (out, err) = (fixture.0.join("adapter-out"), fixture.0.join("adapter-err"));
+    let words: Vec<_> = [adapter]
+        .iter()
+        .chain(prompts)
+        .map(|w| sh_quote(w))
+        .collect();
+    let config = fixture.ssh_launcher(
+        "adapter-launch",
+        &format!(
+            "exec {} > {} 2> {}\n",
+            words.join(" "),
+            sh_quote(&out.to_string_lossy()),
+            sh_quote(&err.to_string_lossy())
+        ),
+    );
+    let child = fixture
+        .command(ssh)
+        .arg("-G")
+        .arg("-F")
+        .arg(&config)
+        .arg("approve-test")
+        .env(approve::REVIEW_ENV, transport)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    AdapterRun {
+        code: None,
+        success: String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line == "hostname accepted"),
+        stdout: fs::read(&out).unwrap(),
+        stderr: fs::read_to_string(&err).unwrap(),
+        parent: format!("{pid}:{}", fs::canonicalize(ssh).unwrap().display()),
     }
 }
 
@@ -827,7 +950,7 @@ fn ssh_mode_runs_directly_and_reviews_each_prompt_separately() {
             "\"$SSH_ASKPASS\" > ssh-env\n",
             "printf '%s' $$ > ssh-pid\n",
             "for key in one two; do\n",
-            "  reply=$(ASKPASS_ARGS=\"$PWD/askpass-$key\" \"$SSH_ASKPASS\" ",
+            "  reply=$(ASKPASS_ARGS=\"$PWD/askpass-$key\" prompt ",
             "\"Enter passphrase for key '/keys/$key': \") || exit 41\n",
             "  [ \"$reply\" = fixture-passphrase ] || exit 42\n",
             "done\n",
@@ -871,7 +994,12 @@ fn ssh_mode_runs_directly_and_reviews_each_prompt_separately() {
         assert_eq!(tail[1], format!("Enter passphrase for key '/keys/{key}': "));
         assert_eq!(tail[2], "--prompt-process");
         let (pid, exe) = tail[3].split_once(':').unwrap();
-        assert_eq!(pid, ssh_pid);
+        match approve::EXPECTED_SSH {
+            // The stand-in ssh is the parent.
+            None => assert_eq!(pid, ssh_pid),
+            // `prompt` used the build-time ssh, as the build requires.
+            Some(ssh) => assert_eq!(Path::new(exe), fs::canonicalize(ssh).unwrap()),
+        }
         assert!(Path::new(exe).is_absolute(), "{exe}");
         // Each call contributes exactly one prompt.
         assert_eq!(review.iter().filter(|arg| *arg == "--prompt").count(), 1);
@@ -883,7 +1011,7 @@ fn ssh_cancellation_reaches_ssh_and_the_failure_status_is_returned() {
     let fixture = Fixture::new();
     fixture.script(
         "ssh",
-        "\"$SSH_ASKPASS\" 'Enter passphrase: ' > /dev/null || exit 255\nexit 0\n",
+        "prompt 'Enter passphrase: ' > /dev/null || exit 255\nexit 0\n",
     );
     let output = fixture
         .command(env!("CARGO_BIN_EXE_approve"))
@@ -905,31 +1033,69 @@ fn ssh_transport() -> String {
 #[test]
 fn ssh_adapter_shows_the_prompt_and_the_parent_executable() {
     let fixture = Fixture::new();
-    let output = fixture
-        .command(env!("CARGO_BIN_EXE_approve-askpass"))
-        .env(approve::REVIEW_ENV, ssh_transport())
-        .arg("Enter passphrase for key '/k\x1b[0m':")
-        .output()
-        .unwrap();
+    let run = run_adapter(
+        &fixture,
+        &ssh_transport(),
+        &["Enter passphrase for key '/k\x1b[0m':"],
+    );
     // The stand-in askpass cancels; the adapter propagates its status.
-    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(!run.success, "{}", run.stderr);
+    assert!(run.code.is_none_or(|code| code == 1), "{}", run.stderr);
     let args = fixture.args("askpass-args");
     let tail = &args[args.len() - 4..];
-    // The adapter's parent here is this test process.
-    let parent = format!(
-        "{}:{}",
-        std::process::id(),
-        std::env::current_exe().unwrap().display()
-    );
     assert_eq!(
         tail,
         [
             "--prompt",
             "Enter passphrase for key '/k\\u{1b}[0m':",
             "--prompt-process",
-            parent.as_str()
+            run.parent.as_str()
         ]
     );
+}
+
+#[test]
+fn ssh_adapter_refuses_prompts_not_from_the_build_time_ssh() {
+    // Without APPROVE_SSH, every parent is accepted.
+    let Some(ssh) = approve::EXPECTED_SSH else {
+        return;
+    };
+    let expected = fs::canonicalize(ssh).unwrap();
+    let fixture = Fixture::new();
+    // Run directly, the adapter's parent is this test binary.
+    let output = fixture
+        .command(env!("CARGO_BIN_EXE_approve-askpass"))
+        .env(approve::REVIEW_ENV, ssh_transport())
+        .arg("Enter passphrase: ")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("refusing passphrase prompt from"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("PID {}", std::process::id())),
+        "{stderr}"
+    );
+    assert!(stderr.contains(&*expected.to_string_lossy()), "{stderr}");
+    assert!(!fixture.0.join("askpass-args").exists());
+
+    // Through approve, a stand-in ssh is refused and sees the failure.
+    fixture.script(
+        "ssh",
+        "\"$SSH_ASKPASS\" 'Enter passphrase: ' > /dev/null || exit 41\nexit 0\n",
+    );
+    let output = fixture
+        .command(env!("CARGO_BIN_EXE_approve"))
+        .args(["--ssh", "-d", "refuse", "--", "ssh", "host"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(41), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("refusing passphrase prompt from"));
+    assert!(!fixture.0.join("askpass-args").exists());
 }
 
 #[test]
@@ -960,12 +1126,12 @@ fn ssh_adapter_refuses_confirmation_notification_and_bad_prompt_counts() {
             "expected one prompt argument",
         );
     }
-    assert_adapter_rejects(
-        &fixture,
-        OsStr::new(&ssh_transport()),
-        &[""],
-        "empty prompt",
-    );
+    let run = run_adapter(&fixture, &ssh_transport(), &[""]);
+    assert!(!run.success);
+    assert!(run.code.is_none_or(|code| code == 1));
+    assert!(run.stdout.is_empty());
+    assert!(run.stderr.contains("empty prompt"), "{}", run.stderr);
+    assert!(!fixture.0.join("askpass-args").exists());
     // A sudo prompt is ignored, and sudo reviews never gain prompt fields.
     let output = fixture
         .command(env!("CARGO_BIN_EXE_approve-askpass"))

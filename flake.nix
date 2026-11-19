@@ -26,8 +26,9 @@
     {
       devShells = forSystems (pkgs: rust: {
         default = pkgs.mkShell {
-          packages = [ rust pkgs.cargo-mutants ];
-          # Use the committed hooks; .githooks/pre-commit runs lint and mutants.
+          packages = [ rust pkgs.cargo-mutants pkgs.openssh ];
+          # Use the committed hooks; .githooks/pre-commit runs lint, the APPROVE_SSH
+          # build's clippy and tests, and mutants.
           shellHook = ''
             git config core.hooksPath .githooks
           '';

@@ -1,15 +1,23 @@
 #!/bin/sh
-# Lint the tree and mutation-test the staged Rust changes.
+# Lint the tree, lint and test the APPROVE_SSH build, and mutation-test the
+# staged Rust changes.
 # Bypass with `git commit --no-verify`; `nix flake check` runs the full suite.
 set -eu
 
 # Re-run inside the dev shell when its tools are missing or stale.
-if [ -z "${APPROVE_HOOK_SHELL:-}" ] && ! command -v cargo-mutants >/dev/null 2>&1; then
+if [ -z "${APPROVE_HOOK_SHELL:-}" ] && ! { command -v cargo-mutants && command -v ssh; } >/dev/null 2>&1; then
     APPROVE_HOOK_SHELL=1 exec nix develop --command "$0" "$@"
 fi
 
 cargo fmt --check
 cargo clippy --quiet --all-targets --all-features -- -D warnings
+
+# APPROVE_SSH is read by option_env!, so this is a separate build that turns on
+# the parent-executable check. Its own target dir keeps both builds cached.
+ssh=$(command -v ssh)
+APPROVE_SSH=$ssh CARGO_TARGET_DIR=target/ssh \
+    cargo clippy --quiet --all-targets --all-features -- -D warnings
+APPROVE_SSH=$ssh CARGO_TARGET_DIR=target/ssh cargo test --quiet
 
 diff=$(mktemp)
 trap 'rm -f "$diff"' EXIT

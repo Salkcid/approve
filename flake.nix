@@ -12,22 +12,34 @@
   outputs = { nixpkgs, rust-overlay, ... }:
     let
       systems = [ "x86_64-linux" "aarch64-linux" ];
-    in
-    {
-      devShells = nixpkgs.lib.genAttrs systems (system:
+      forSystems = f: nixpkgs.lib.genAttrs systems (system:
         let
           pkgs = import nixpkgs {
             inherit system;
             overlays = [ rust-overlay.overlays.default ];
           };
-          rust = pkgs.rust-bin.stable.latest.default.override {
-            extensions = [ "rust-src" "rust-analyzer" ];
-          };
         in
-        {
-          default = pkgs.mkShell {
-            packages = [ rust ];
-          };
-        });
+        f pkgs (pkgs.rust-bin.stable.latest.default.override {
+          extensions = [ "rust-src" "rust-analyzer" ];
+        }));
+    in
+    {
+      devShells = forSystems (pkgs: rust: {
+        default = pkgs.mkShell {
+          packages = [ rust ];
+        };
+      });
+
+      # `nix flake check` enforces formatting and the [lints] table in Cargo.toml.
+      # The crate has no dependencies, so cargo runs offline without vendoring.
+      checks = forSystems (pkgs: rust: {
+        lint = pkgs.runCommand "approve-lint" { nativeBuildInputs = [ rust ]; } ''
+          cp -r ${./.} src && chmod -R u+w src && cd src
+          export CARGO_HOME=$TMPDIR/cargo
+          cargo fmt --check
+          cargo clippy --offline --all-targets --all-features -- -D warnings
+          touch $out
+        '';
+      });
     };
 }

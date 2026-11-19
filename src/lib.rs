@@ -68,8 +68,16 @@ impl Request {
 // JSON-like quoting is display notation, never input to a shell. ASCII-only
 // output also escapes bidi controls, zero-width characters, and invalid UTF-8
 // without lossy replacement. \xNN denotes a raw non-UTF-8 byte.
+#[must_use]
 pub fn quote(value: &OsStr) -> String {
     let mut out = String::from("\"");
+    push_escaped(&mut out, value);
+    out.push('"');
+    out
+}
+
+// Writing to a String cannot fail, so the fmt::Result is discarded.
+fn push_escaped(out: &mut String, value: &OsStr) {
     for chunk in value.as_bytes().utf8_chunks() {
         for c in chunk.valid().chars() {
             match c {
@@ -79,15 +87,13 @@ pub fn quote(value: &OsStr) -> String {
                 '\r' => out.push_str("\\r"),
                 '\t' => out.push_str("\\t"),
                 ' '..='~' => out.push(c),
-                _ => write!(out, "\\u{{{:x}}}", c as u32).unwrap(),
+                _ => _ = write!(out, "\\u{{{:x}}}", c as u32),
             }
         }
         for b in chunk.invalid() {
-            write!(out, "\\x{b:02x}").unwrap();
+            _ = write!(out, "\\x{b:02x}");
         }
     }
-    out.push('"');
-    out
 }
 
 fn status_number(status: &str, key: &str) -> Option<u32> {
@@ -106,6 +112,7 @@ pub struct Origin {
     pub executable: OsString,
 }
 
+#[derive(Debug)]
 pub struct Facts {
     pub cwd: PathBuf,
     pub uid: u32,
@@ -140,8 +147,7 @@ impl Facts {
                 break;
             }
             let executable = fs::read_link(proc.join(format!("{pid}/exe")))
-                .map(|p| p.into_os_string())
-                .unwrap_or_else(|_| "executable unavailable".into());
+                .map_or_else(|_| "executable unavailable".into(), PathBuf::into_os_string);
             origin.push(Origin { pid, executable });
             parent = fs::read_to_string(proc.join(format!("{pid}/status")))
                 .ok()
@@ -171,8 +177,9 @@ fn passwd_name(uid: u32, path: &Path) -> Option<OsString> {
 // Every value uses the same reversible ASCII notation, without outer quotes.
 // askpass further escapes command arguments; it displays the cwd literally.
 fn display_value(value: &OsStr) -> String {
-    let quoted = quote(value);
-    quoted[1..quoted.len() - 1].to_owned()
+    let mut out = String::new();
+    push_escaped(&mut out, value);
+    out
 }
 
 pub fn review_arguments(request: &Request, facts: &Facts) -> Result<Vec<String>, String> {
@@ -193,8 +200,7 @@ pub fn review_arguments(request: &Request, facts: &Facts) -> Result<Vec<String>,
         facts
             .username
             .as_deref()
-            .map(display_value)
-            .unwrap_or_else(|| "unavailable".into()),
+            .map_or_else(|| "unavailable".into(), display_value),
         "--requesting-uid".into(),
         facts.uid.to_string(),
     ]);
@@ -218,7 +224,7 @@ pub fn encode_review(args: &[String]) -> Result<String, String> {
     validate_review(args)?;
     let mut encoded = String::new();
     for arg in args {
-        write!(encoded, "{}:{arg}", arg.len()).unwrap();
+        _ = write!(encoded, "{}:{arg}", arg.len());
     }
     Ok(encoded)
 }
@@ -236,9 +242,11 @@ pub fn decode_review(encoded: &str) -> Result<Vec<String>, String> {
             return Err("invalid review field length".into());
         }
         let length: usize = length.parse().map_err(|_| "invalid review field length")?;
-        let value = tail.get(..length).ok_or("invalid review field boundary")?;
+        let (value, tail) = tail
+            .split_at_checked(length)
+            .ok_or("invalid review field boundary")?;
         args.push(value.to_owned());
-        rest = &tail[length..];
+        rest = tail;
     }
     validate_review(&args)?;
     Ok(args)
@@ -256,13 +264,14 @@ fn validate_review(args: &[String]) -> Result<(), String> {
     if args.iter().map(String::len).sum::<usize>() > MAX_REVIEW_BYTES {
         return Err("review exceeds askpass's 16 KiB budget; refusing to truncate".into());
     }
-    if args.first().map(String::as_str) != Some("--review") || args.len() % 2 != 1 {
-        return Err("invalid review arguments".into());
-    }
+    let fields = match args.split_first() {
+        Some((first, fields)) if first == "--review" && fields.len() % 2 == 0 => fields,
+        _ => return Err("invalid review arguments".into()),
+    };
     let mut seen = HashSet::new();
     let mut command_count = 0;
     let mut kind = "sudo";
-    let (pairs, _) = args[1..].as_chunks::<2>();
+    let (pairs, _) = fields.as_chunks::<2>();
     for [option, value] in pairs {
         let option = option.as_str();
         match option {
@@ -336,6 +345,7 @@ fn validate_review(args: &[String]) -> Result<(), String> {
     }
 }
 
+#[must_use]
 pub fn is_ssh_review(args: &[String]) -> bool {
     args.get(1..)
         .unwrap_or_default()
@@ -371,24 +381,29 @@ pub fn ssh_prompt_review(
 /// Interpret ssh's `SSH_ASKPASS_PROMPT` hint. askpass only collects a secret,
 /// so confirmation and notification prompts are refused instead of answered.
 pub fn check_ssh_prompt_hint(hint: Option<&OsStr>) -> Result<(), String> {
-    match hint.map(OsStr::as_bytes) {
-        None | Some(b"") => Ok(()),
-        Some(b"confirm") => Err(
+    let Some(hint) = hint else {
+        return Ok(());
+    };
+    match hint.as_bytes() {
+        b"" => Ok(()),
+        b"confirm" => Err(
             "ssh requested a yes/no confirmation (SSH_ASKPASS_PROMPT=confirm); approve only answers passphrase prompts, so the request is refused".into(),
         ),
-        Some(b"none") => Err(
+        b"none" => Err(
             "ssh requested a notification without input (SSH_ASKPASS_PROMPT=none); approve only answers passphrase prompts, so the request is refused".into(),
         ),
-        Some(_) => Err(format!(
+        _ => Err(format!(
             "unsupported SSH_ASKPASS_PROMPT value {}",
-            quote(hint.unwrap())
+            quote(hint)
         )),
     }
 }
 
-/// Identify the process that will read the adapter's output. In ssh mode the
-/// passphrase goes to this parent, so its executable is read from `/proc` (not
-/// from the environment) and, when `expected` is fixed, must match it exactly.
+/// Identify the process that will read the adapter's output.
+///
+/// In ssh mode the passphrase goes to this parent, so its executable is read
+/// from `/proc` (not from the environment) and, when `expected` is fixed, must
+/// match it exactly.
 pub fn prompt_process(proc: &Path, expected: Option<&Path>) -> Result<Origin, String> {
     let status = fs::read_to_string(proc.join("self/status"))
         .map_err(|e| format!("cannot read process identity: {e}"))?;
@@ -440,6 +455,7 @@ pub fn find_askpass() -> Result<PathBuf, String> {
 
 /// Build the command that replaces approve. Only this child receives the
 /// askpass selection and the review transport.
+#[must_use]
 pub fn launch_command(request: &Request, helper: &Path, askpass: &Path, review: &str) -> Command {
     let mut command = match request.mode {
         Mode::Sudo => {
@@ -451,9 +467,15 @@ pub fn launch_command(request: &Request, helper: &Path, askpass: &Path, review: 
             command
         }
         Mode::Ssh => {
-            let mut command = Command::new(&request.command[0]);
+            // Request::parse rejects an empty command; if one is built by
+            // hand anyway, executing "" fails instead of panicking.
+            let (program, args) = request
+                .command
+                .split_first()
+                .map_or_default(|(program, args)| (program.as_os_str(), args));
+            let mut command = Command::new(program);
             command
-                .args(&request.command[1..])
+                .args(args)
                 .env("SSH_ASKPASS", helper)
                 // Use the dialog with or without a terminal or display variable.
                 .env("SSH_ASKPASS_REQUIRE", "force");
@@ -467,6 +489,11 @@ pub fn launch_command(request: &Request, helper: &Path, askpass: &Path, review: 
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    reason = "tests fail loudly on unexpected values"
+)]
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
@@ -771,7 +798,7 @@ mod tests {
         let ssh = review_arguments(&request, &sample_facts()).unwrap();
         let with = |base: &[String], extra: &[&str]| {
             let mut args = base.to_vec();
-            args.extend(extra.iter().map(|s| s.to_string()));
+            args.extend(extra.iter().map(ToString::to_string));
             encode_review(&args)
         };
         assert!(

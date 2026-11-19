@@ -1,3 +1,9 @@
+#![expect(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    reason = "tests fail loudly on unexpected values"
+)]
+
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::Write;
@@ -129,7 +135,7 @@ struct AdapterRun {
 }
 
 /// Run the adapter as the child of a parent this build accepts. Without
-/// APPROVE_SSH any parent is accepted, so this test process runs it. With it,
+/// `APPROVE_SSH` any parent is accepted, so this test process runs it. With it,
 /// only the build-time ssh is, so that ssh launches the adapter (see
 /// `Fixture::ssh_launcher`); ssh then reveals only success or failure.
 fn run_adapter(fixture: &Fixture, transport: &str, prompts: &[&str]) -> AdapterRun {
@@ -154,8 +160,7 @@ fn run_adapter(fixture: &Fixture, transport: &str, prompts: &[&str]) -> AdapterR
         };
     };
     let (out, err) = (fixture.0.join("adapter-out"), fixture.0.join("adapter-err"));
-    let words: Vec<_> = [adapter]
-        .iter()
+    let words: Vec<_> = std::iter::once(&adapter)
         .chain(prompts)
         .map(|w| sh_quote(w))
         .collect();
@@ -327,7 +332,7 @@ fn adapter_passes_structured_values_and_propagates_cancellation() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
     assert_eq!(
         fixture.args("askpass-args"),
         review.iter().map(OsString::from).collect::<Vec<_>>()
@@ -362,7 +367,7 @@ fn complete_adapter_path_cancels_or_executes_without_cli_reading_its_output() {
     };
     let cancelled = run();
     assert_eq!(cancelled.status.code(), Some(1));
-    assert!(cancelled.stdout.is_empty());
+    assert_eq!(String::from_utf8_lossy(&cancelled.stdout), "");
     assert!(!fixture.0.join("marker").exists());
     fixture.script(
         "askpass",
@@ -382,7 +387,7 @@ fn adapter_rejects_missing_malformed_and_oversized_transport() {
     let fixture = Fixture::new();
     for encoded in [
         None,
-        Some("".into()),
+        Some(String::new()),
         Some("99:short".into()),
         Some("1:é".into()),
         Some("0:".repeat(25000)),
@@ -395,7 +400,7 @@ fn adapter_rejects_missing_malformed_and_oversized_transport() {
         }
         let output = command.output().unwrap();
         assert_eq!(output.status.code(), Some(1));
-        assert!(output.stdout.is_empty());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "");
         assert!(!fixture.0.join("askpass-args").exists());
     }
 }
@@ -534,9 +539,11 @@ fn executable_lookup_supports_path_and_rejects_invalid_override() {
 
 // Deliberately bypass the production encoder to exercise adapter-side validation.
 fn unchecked_transport(args: &[String]) -> String {
-    args.iter()
-        .map(|value| format!("{}:{value}", value.len()))
-        .collect()
+    use std::fmt::Write as _;
+    args.iter().fold(String::new(), |mut out, value| {
+        _ = write!(out, "{}:{value}", value.len());
+        out
+    })
 }
 
 fn assert_adapter_rejects(fixture: &Fixture, transport: &OsStr, prompts: &[&str], message: &str) {
@@ -547,7 +554,7 @@ fn assert_adapter_rejects(fixture: &Fixture, transport: &OsStr, prompts: &[&str]
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
     assert!(
         String::from_utf8_lossy(&output.stderr).contains(message),
         "{output:?}"
@@ -928,7 +935,7 @@ fn startup_failures_report_errors_without_running_the_target() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
     assert!(String::from_utf8_lossy(&output.stderr).contains("could not execute askpass"));
     assert!(!fixture.0.join("askpass-args").exists());
 }
@@ -1072,7 +1079,7 @@ fn ssh_adapter_refuses_prompts_not_from_the_build_time_ssh() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("refusing passphrase prompt from"),
@@ -1116,7 +1123,7 @@ fn ssh_adapter_refuses_confirmation_notification_and_bad_prompt_counts() {
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(1));
-        assert!(output.stdout.is_empty());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "");
         assert!(String::from_utf8_lossy(&output.stderr).contains(message));
         assert!(!fixture.0.join("askpass-args").exists());
     }
@@ -1131,7 +1138,7 @@ fn ssh_adapter_refuses_confirmation_notification_and_bad_prompt_counts() {
     let run = run_adapter(&fixture, &ssh_transport(), &[""]);
     assert!(!run.success);
     assert!(run.code.is_none_or(|code| code == 1));
-    assert!(run.stdout.is_empty());
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "");
     assert!(run.stderr.contains("empty prompt"), "{}", run.stderr);
     assert!(!fixture.0.join("askpass-args").exists());
     // A sudo prompt is ignored, and sudo reviews never gain prompt fields.

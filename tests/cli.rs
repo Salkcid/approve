@@ -10,8 +10,50 @@ use std::io::Write;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{PoisonError, RwLock};
+
+/// A forked child inherits every open descriptor until it execs, close-on-exec
+/// ones included. If one test thread forks while another has a fixture open for
+/// writing, executing that fixture fails with ETXTBSY until the child execs.
+/// Writes share this lock and spawns take it exclusively, so no fork overlaps a
+/// write. `Command::spawn` returns only once the child has exec'd, so the lock
+/// is not held while it runs. Use `write`, `copy`, `spawn_guarded` and
+/// `output_guarded` in this file, never the unguarded std calls.
+static FORK: RwLock<()> = RwLock::new(());
+
+fn write(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) {
+    let _guard = FORK.read().unwrap_or_else(PoisonError::into_inner);
+    fs::write(path, contents).unwrap();
+}
+
+fn copy(from: impl AsRef<Path>, to: impl AsRef<Path>) {
+    let _guard = FORK.read().unwrap_or_else(PoisonError::into_inner);
+    fs::copy(from, to).unwrap();
+}
+
+trait SpawnGuarded {
+    fn spawn_guarded(&mut self) -> Child;
+    /// Like `Command::output`: stdin is null and stdout and stderr are captured.
+    fn output_guarded(&mut self) -> Output;
+}
+
+impl SpawnGuarded for Command {
+    fn spawn_guarded(&mut self) -> Child {
+        let _guard = FORK.write().unwrap_or_else(PoisonError::into_inner);
+        self.spawn().unwrap()
+    }
+
+    fn output_guarded(&mut self) -> Output {
+        self.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn_guarded()
+            .wait_with_output()
+            .unwrap()
+    }
+}
 
 struct Fixture(PathBuf);
 
@@ -78,20 +120,19 @@ impl Fixture {
         self.script(name, body);
         let config = self.0.join(format!("{name}.ssh-config"));
         let launcher = self.0.join(name);
-        fs::write(
+        write(
             &config,
             format!(
                 "Match exec \"exec {}\"\n  Hostname accepted\n",
                 launcher.display()
             ),
-        )
-        .unwrap();
+        );
         config
     }
 
     fn script(&self, name: &str, body: &str) {
         let path = self.0.join(name);
-        fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
+        write(&path, format!("#!/bin/sh\n{body}"));
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
     }
 
@@ -145,8 +186,7 @@ fn run_adapter(fixture: &Fixture, transport: &str, prompts: &[&str]) -> AdapterR
             .command(adapter)
             .env(approve::REVIEW_ENV, transport)
             .args(prompts)
-            .output()
-            .unwrap();
+            .output_guarded();
         return AdapterRun {
             code: output.status.code(),
             success: output.status.success(),
@@ -182,8 +222,7 @@ fn run_adapter(fixture: &Fixture, transport: &str, prompts: &[&str]) -> AdapterR
         .env(approve::REVIEW_ENV, transport)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .spawn_guarded();
     let pid = child.id();
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success(), "{output:?}");
@@ -221,7 +260,7 @@ fn preserves_execution_arguments_cwd_streams_and_status() {
     command.args(["-d", "test %u <b>_reason_</b>", "--", "/bin/sh", "-c",
         "printf '%s\\0' \"$@\" > \"$TARGET_ARGS\"; IFS= read -r line; printf 'out:%s' \"$line\"; printf 'err' >&2; exit 37", "test"])
         .args(&values).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = command.spawn().unwrap();
+    let mut child = command.spawn_guarded();
     child.stdin.take().unwrap().write_all(b"input\n").unwrap();
     let output = child.wait_with_output().unwrap();
     assert_eq!(output.status.code(), Some(37));
@@ -281,8 +320,7 @@ fn sudo_failure_is_returned_without_running_the_target() {
             "-c",
             "printf created > marker",
         ])
-        .output()
-        .unwrap();
+        .output_guarded();
     assert_eq!(output.status.code(), Some(1));
     assert!(!fixture.0.join("marker").exists());
 }
@@ -294,8 +332,7 @@ fn help_prints_usage_without_invoking_sudo() {
         let output = fixture
             .command(env!("CARGO_BIN_EXE_approve"))
             .arg(flag)
-            .output()
-            .unwrap();
+            .output_guarded();
         assert!(output.status.success());
         assert_eq!(
             String::from_utf8(output.stdout).unwrap(),
@@ -321,16 +358,14 @@ fn invalid_and_oversized_requests_never_invoke_sudo() {
         let output = fixture
             .command(env!("CARGO_BIN_EXE_approve"))
             .args(args)
-            .output()
-            .unwrap();
+            .output_guarded();
         assert_eq!(output.status.code(), Some(2));
         assert!(!fixture.0.join("sudo-args").exists());
     }
     let output = fixture
         .command(env!("CARGO_BIN_EXE_approve"))
         .args(["-d", "large", "--", "id", &"x".repeat(17000)])
-        .output()
-        .unwrap();
+        .output_guarded();
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("refusing to truncate"));
     assert!(!fixture.0.join("sudo-args").exists());
@@ -347,8 +382,7 @@ fn adapter_passes_structured_values_and_propagates_cancellation() {
             approve::encode_review(&review).unwrap(),
         )
         .arg("ignored sudo prompt %u")
-        .output()
-        .unwrap();
+        .output_guarded();
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(String::from_utf8_lossy(&output.stdout), "");
     assert_eq!(
@@ -380,8 +414,7 @@ fn complete_adapter_path_cancels_or_executes_without_cli_reading_its_output() {
                 "-c",
                 "printf created > marker; printf result; exit 18",
             ])
-            .output()
-            .unwrap()
+            .output_guarded()
     };
     let cancelled = run();
     assert_eq!(cancelled.status.code(), Some(1));
@@ -416,7 +449,7 @@ fn adapter_rejects_missing_malformed_and_oversized_transport() {
         if let Some(encoded) = encoded {
             command.env(approve::REVIEW_ENV, encoded);
         }
-        let output = command.output().unwrap();
+        let output = command.output_guarded();
         assert_eq!(output.status.code(), Some(1));
         assert_eq!(String::from_utf8_lossy(&output.stdout), "");
         assert!(!fixture.0.join("askpass-args").exists());
@@ -558,7 +591,7 @@ fn executable_lookup_supports_path_and_rejects_invalid_override() {
         if let Some(path) = override_path {
             command.env("APPROVE_ASKPASS", path);
         }
-        command.output().unwrap()
+        command.output_guarded()
     };
     assert!(run(None).status.success());
     for path in [Path::new("relative"), Path::new("/missing/askpass")] {
@@ -582,8 +615,7 @@ fn assert_adapter_rejects(fixture: &Fixture, transport: &OsStr, prompts: &[&str]
         .command(env!("CARGO_BIN_EXE_approve-askpass"))
         .env(approve::REVIEW_ENV, transport)
         .args(prompts)
-        .output()
-        .unwrap();
+        .output_guarded();
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(String::from_utf8_lossy(&output.stdout), "");
     assert!(
@@ -812,8 +844,7 @@ fn escaping_can_exceed_budget_before_sudo_runs() {
         let output = fixture
             .command(env!("CARGO_BIN_EXE_approve"))
             .args(["-d", &description, "--", "echo", &argument])
-            .output()
-            .unwrap();
+            .output_guarded();
         assert_eq!(output.status.code(), Some(2));
         assert!(String::from_utf8_lossy(&output.stderr).contains("refusing to truncate"));
         assert!(!fixture.0.join("sudo-args").exists());
@@ -881,8 +912,7 @@ fn target_signal_is_preserved() {
     let output = fixture
         .command(env!("CARGO_BIN_EXE_approve"))
         .args(["-d", "signal test", "--", "/bin/sh", "-c", "kill -TERM $$"])
-        .output()
-        .unwrap();
+        .output_guarded();
     assert_eq!(output.status.signal(), Some(15));
 }
 
@@ -899,12 +929,11 @@ fn startup_failures_report_errors_without_running_the_target() {
                 "-c",
                 "printf created > marker",
             ])
-            .output()
-            .unwrap()
+            .output_guarded()
     };
     let fixture = Fixture::new();
     let isolated = fixture.0.join("approve");
-    fs::copy(env!("CARGO_BIN_EXE_approve"), &isolated).unwrap();
+    copy(env!("CARGO_BIN_EXE_approve"), &isolated);
     let output = run(&fixture, isolated.to_str().unwrap());
     assert_eq!(output.status.code(), Some(2));
     assert!(
@@ -917,7 +946,7 @@ fn startup_failures_report_errors_without_running_the_target() {
         let fixture = Fixture::new();
         fs::remove_file(fixture.0.join("askpass")).unwrap();
         match mode {
-            "non-executable" => fs::write(fixture.0.join("askpass"), "data").unwrap(),
+            "non-executable" => write(fixture.0.join("askpass"), "data"),
             "directory" => fs::create_dir(fixture.0.join("askpass")).unwrap(),
             _ => {}
         }
@@ -926,10 +955,7 @@ fn startup_failures_report_errors_without_running_the_target() {
             if !use_override {
                 command.env_remove("APPROVE_ASKPASS");
             }
-            let output = command
-                .args(["-d", "startup", "--", "id"])
-                .output()
-                .unwrap();
+            let output = command.args(["-d", "startup", "--", "id"]).output_guarded();
             assert_eq!(output.status.code(), Some(2));
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(
@@ -954,17 +980,15 @@ fn startup_failures_report_errors_without_running_the_target() {
     let fixture = Fixture::new();
     // Executable metadata passes lookup, but the interpreter cannot be executed.
     fixture.script("askpass", "exit 0\n");
-    fs::write(
+    write(
         fixture.0.join("askpass"),
         "#!/missing/approve-test-interpreter\n",
-    )
-    .unwrap();
+    );
     let output = fixture
         .command(env!("CARGO_BIN_EXE_approve-askpass"))
         .env(approve::REVIEW_ENV, unchecked_transport(&sample_review()))
         .arg("Password: ")
-        .output()
-        .unwrap();
+        .output_guarded();
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(String::from_utf8_lossy(&output.stdout), "");
     assert!(String::from_utf8_lossy(&output.stderr).contains("could not execute askpass"));
@@ -1010,8 +1034,7 @@ fn ssh_mode_runs_directly_and_reviews_each_prompt_separately() {
             "-T",
             "git@example.com",
         ])
-        .output()
-        .unwrap();
+        .output_guarded();
     assert_eq!(output.status.code(), Some(23), "{output:?}");
     assert_eq!(fixture.args("target-args"), ["-T", "git@example.com"]);
     assert!(!fixture.0.join("sudo-args").exists());
@@ -1056,8 +1079,7 @@ fn ssh_cancellation_reaches_ssh_and_the_failure_status_is_returned() {
     let output = fixture
         .command(env!("CARGO_BIN_EXE_approve"))
         .args(["--ssh", "-d", "cancel", "--", "ssh", "host"])
-        .output()
-        .unwrap();
+        .output_guarded();
     assert_eq!(output.status.code(), Some(255));
     assert!(fixture.0.join("askpass-args").exists());
 }
@@ -1107,8 +1129,7 @@ fn ssh_adapter_refuses_prompts_not_from_the_build_time_ssh() {
         .command(env!("CARGO_BIN_EXE_approve-askpass"))
         .env(approve::REVIEW_ENV, ssh_transport())
         .arg("Enter passphrase: ")
-        .output()
-        .unwrap();
+        .output_guarded();
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(String::from_utf8_lossy(&output.stdout), "");
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1131,8 +1152,7 @@ fn ssh_adapter_refuses_prompts_not_from_the_build_time_ssh() {
     let output = fixture
         .command(env!("CARGO_BIN_EXE_approve"))
         .args(["--ssh", "-d", "refuse", "--", "ssh", "host"])
-        .output()
-        .unwrap();
+        .output_guarded();
     assert_eq!(output.status.code(), Some(41), "{output:?}");
     assert!(String::from_utf8_lossy(&output.stderr).contains("refusing passphrase prompt from"));
     assert!(!fixture.0.join("askpass-args").exists());
@@ -1151,8 +1171,7 @@ fn ssh_adapter_refuses_confirmation_notification_and_bad_prompt_counts() {
             .env(approve::REVIEW_ENV, ssh_transport())
             .env("SSH_ASKPASS_PROMPT", hint)
             .arg("Allow use of key? ")
-            .output()
-            .unwrap();
+            .output_guarded();
         assert_eq!(output.status.code(), Some(1));
         assert_eq!(String::from_utf8_lossy(&output.stdout), "");
         assert!(String::from_utf8_lossy(&output.stderr).contains(message));
@@ -1178,8 +1197,7 @@ fn ssh_adapter_refuses_confirmation_notification_and_bad_prompt_counts() {
         .env(approve::REVIEW_ENV, unchecked_transport(&sample_review()))
         .env("SSH_ASKPASS_PROMPT", "confirm")
         .arg("Password: ")
-        .output()
-        .unwrap();
+        .output_guarded();
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(
         fixture.args("askpass-args"),
@@ -1196,8 +1214,7 @@ fn ssh_mode_reports_a_missing_command_without_sudo() {
     let output = fixture
         .command(env!("CARGO_BIN_EXE_approve"))
         .args(["--ssh", "-d", "missing", "--", "no-such-ssh"])
-        .output()
-        .unwrap();
+        .output_guarded();
     assert_eq!(output.status.code(), Some(2));
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("could not execute \"no-such-ssh\""),

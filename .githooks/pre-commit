@@ -3,8 +3,9 @@
 # Bypass with `git commit --no-verify`; `nix flake check` runs the full suite.
 set -eu
 
-if [ -z "${IN_NIX_SHELL:-}" ]; then
-    exec nix develop --command "$0" "$@"
+# Re-run inside the dev shell when its tools are missing or stale.
+if [ -z "${APPROVE_HOOK_SHELL:-}" ] && ! command -v cargo-mutants >/dev/null 2>&1; then
+    APPROVE_HOOK_SHELL=1 exec nix develop --command "$0" "$@"
 fi
 
 cargo fmt --check

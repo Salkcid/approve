@@ -17,6 +17,28 @@ and SSH askpass settings are untouched. In SSH mode, the command itself receives
 from the dialog's environment and replaces itself with askpass. Password output
 flows directly from askpass into sudo's pipe.
 
+## Supported build
+
+What's guaranteed to work is the flake's `packages.default` at a given commit,
+built from that commit's `flake.lock`: Rust 1.100.0 from rust-overlay, on
+nixos-26.05. `nix flake check` builds and tests exactly that derivation.
+
+```nix
+inputs.approve.url = "github:Salkcid/approve";
+# ...
+inputs.approve.packages.${system}.default.override {
+  expectedSsh = "${pkgs.openssh}/bin/ssh";  # optional, see SSH mode
+}
+```
+
+The package does not bundle askpass: put it on `PATH` or wrap `approve` with
+`APPROVE_ASKPASS` set, as described below.
+
+Any other combination builds at your own discretion: overriding inputs (for
+example `inputs.approve.inputs.nixpkgs.follows`), calling `package.nix` with your
+own `rustPlatform`, or building with plain cargo. `rust-version` in
+`Cargo.toml` marks the minimum compiler: cargo refuses an older one.
+
 ## Install and use
 
 Build askpass separately in its GTK 4 development environment, then install both
@@ -68,9 +90,11 @@ README for the optional Niri floating-window rule.
 
 ## Development
 
-The development environment uses stable Rust packages from nixpkgs, pinned by
-`flake.lock`. Nix supplies `rustc`, `cargo`, `rustfmt`, `clippy`, `rust-analyzer`,
-and the default compiler/linker support from `pkgs.mkShell`.
+The development environment uses Rust 1.100.0 from rust-overlay, the same
+toolchain as the checks and `packages.default`. It is pinned in `flake.nix` and
+kept in step with `rust-version` in `Cargo.toml`. Nix supplies `rustc`, `cargo`,
+`rustfmt`, `clippy`, `rust-analyzer`, and the default compiler/linker support from
+`pkgs.mkShell`.
 
 With Nix, direnv, and nix-direnv installed, enter the project directory and trust
 the reviewed `.envrc` once:

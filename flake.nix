@@ -1,5 +1,5 @@
 {
-  description = "Rust development environment for approve";
+  description = "approve: review sudo and SSH askpass prompts";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
